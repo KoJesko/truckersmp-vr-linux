@@ -1,0 +1,1751 @@
+#!/usr/bin/env bash
+#
+# truckvr — set up and toggle VR for Euro Truck Simulator 2 and American Truck
+#           Simulator on Linux, with WiVRn (OpenXR) and optionally TruckersMP.
+#
+#   truckvr                    diagnose everything (same as `truckvr doctor`)
+#   truckvr install            do whatever is needed to make VR work
+#   truckvr on   [ets2|ats]    enable VR for the next launch
+#   truckvr off  [ets2|ats]    back to flat (monitor) mode
+#   truckvr patch              (re)apply the setupapi stub patch
+#   truckvr runtime            point OpenXR at WiVRn
+#   truckvr protons            list installed Protons and whether each can do VR
+#   truckvr revert             undo everything this script changed
+#
+# Requires: bash 4.2+, python3 (standard library only). No other dependencies.
+#
+# ---------------------------------------------------------------------------
+# WHY THIS SCRIPT EXISTS
+#
+# Getting these two games into VR on Linux means clearing four independent
+# hurdles. Each one, on its own, produces a different flavour of "it doesn't
+# work", and fixing one only reveals the next:
+#
+#  1. OPENXR RUNTIME. Something has to tell the game which OpenXR runtime to
+#     talk to: $XDG_CONFIG_HOME/openxr/1/active_runtime.json. If it is missing
+#     the game finds no headset. If SteamVR has ever run, it replaces the file
+#     with its own and deletes it again on exit, so a working setup silently
+#     stops working.
+#
+#  2. PRESSURE-VESSEL. Steam runs games inside a container that does not see
+#     the host's OpenXR runtime unless you set
+#     PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1 in the launch options.
+#
+#  3. PROTON VERSION. ETS2/ATS (Prism3D) destroy and recreate their XrSession
+#     during startup. Older wineopenxr kept the dead handle in its session
+#     list, so the game never called xrBeginSession and sat in xrPollEvent
+#     forever — stereo renders on the monitor while the headset stays on the
+#     WiVRn lobby. Fixed by Proton PR #9915 (2026-07-07). You need
+#     GE-Proton11-3+, Proton Experimental from 2026-07-07+, or any build newer
+#     than that.
+#
+#  4. TRUCKERSMP + setupapi. Only if you use TruckersMP: core_*mp.dll calls
+#     setupapi.SetupDiGetDeviceInterfaceAlias, which is an unimplemented
+#     `@ stub` in *every* Wine and Proton build — still a stub in Wine master.
+#     Calling a Wine stub raises EXCEPTION_WINE_STUB and hard-kills the
+#     process, so the game dies at the TruckersMP login screen. This script
+#     binary-patches the stub thunk to return FALSE ("no alias found"), which
+#     is a perfectly normal result for that API.
+#
+# Plus one thing that is easy to miss: when TruckersMP launches the game it
+# builds its own command line, so VR flags placed in Steam's launch options
+# are thrown away. They have to go in TruckersMP's launcher-options.json too.
+# This script writes both.
+# ---------------------------------------------------------------------------
+
+set -euo pipefail
+
+# Deterministic ordering for globs and sorts, without disturbing the encoding —
+# which directory "wins" a name collision must not depend on the user's locale.
+export LC_COLLATE=C
+
+VERSION=1.0.0
+SELF=${0##*/}
+
+# ------------------------------------------------------------------ constants
+
+# The two games. Everything else is derived from these.
+declare -A GAME_APPID=( [ets2]=227300      [ats]=270880 )
+declare -A GAME_NAME=(  [ets2]="Euro Truck Simulator 2" [ats]="American Truck Simulator" )
+declare -A GAME_EXE=(   [ets2]=eurotrucks2.exe [ats]=amtrucks.exe )
+GAMES_ALL=(ets2 ats)
+
+# Flags that put Prism3D into VR. Since game v1.55 these live in the main
+# branch — the old oculus/openvr beta branch is obsolete, and `-openvr` mode is
+# broken on 1.50+.
+VR_FLAGS=(-experimental_vr -openxr)
+
+# The environment variable that lets the pressure-vessel container see WiVRn.
+PV_VAR='PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1'
+
+# Proton PR #9915 (the wineopenxr XrSession fix) landed on this date. Builds
+# stamped on or after it have the fix.
+FIX_DATE=20260707
+# ...and the first GE-Proton release containing it.
+FIX_GE_MAJOR=11
+FIX_GE_MINOR=3
+
+XDG_CONFIG="${XDG_CONFIG_HOME:-$HOME/.config}"
+XDG_DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+XR_RUNTIME="$XDG_CONFIG/openxr/1/active_runtime.json"
+BACKUPS="$XDG_DATA/truckvr/backups"
+STATE="$XDG_DATA/truckvr/state"
+
+# --------------------------------------------------------------------- output
+
+use_color=1
+[[ -t 1 ]] || use_color=0
+[[ -n "${NO_COLOR:-}" ]] && use_color=0
+
+setup_color() {
+  if (( use_color )); then
+    c_ok=$'\033[32m'; c_warn=$'\033[33m'; c_err=$'\033[31m'
+    c_dim=$'\033[2m'; c_hd=$'\033[1m'; c_off=$'\033[0m'
+  else
+    c_ok= c_warn= c_err= c_dim= c_hd= c_off=
+  fi
+}
+setup_color
+
+ok()   { printf '  %s✔%s %s\n'  "$c_ok"   "$c_off" "$*"; }
+warn() { printf '  %s!%s %s\n'  "$c_warn" "$c_off" "$*"; WARNINGS=$((WARNINGS+1)); }
+bad()  { printf '  %s✘%s %s\n'  "$c_err"  "$c_off" "$*"; PROBLEMS=$((PROBLEMS+1)); }
+note() { printf '      %s%s%s\n' "$c_dim" "$*" "$c_off"; }
+head_() { printf '\n%s%s%s\n' "$c_hd" "$*" "$c_off"; }
+say()  { printf '%s\n' "$*"; }
+die()  { printf '%serror:%s %s\n' "$c_err" "$c_off" "$*" >&2; exit 1; }
+tilde() { printf '%s' "${1/#$HOME/\~}"; }
+
+WARNINGS=0
+PROBLEMS=0
+
+# ------------------------------------------------------------- python "engine"
+#
+# Everything that needs real parsing — Steam's VDF files, TruckersMP's JSON,
+# and the PE export table of setupapi.dll — is handled here. Bash does the
+# orchestration and the talking; python does the reading and writing.
+#
+# Invoked as:  py <subcommand> [args...]
+
+read -r -d '' PY_ENGINE <<'PYEOF' || true
+import json, os, re, shutil, struct, sys, tempfile
+
+# ----------------------------------------------------------------- VDF parsing
+
+def vdf_tokens(text):
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if c in ' \t\r\n':
+            i += 1; continue
+        if c == '/' and i + 1 < n and text[i+1] == '/':
+            j = text.find('\n', i)
+            i = n if j < 0 else j + 1
+            continue
+        if c in '{}':
+            yield c; i += 1; continue
+        if c == '"':
+            i += 1; buf = []
+            while i < n and text[i] != '"':
+                if text[i] == '\\' and i + 1 < n:
+                    nxt = text[i+1]
+                    buf.append({'n': '\n', 't': '\t', '\\': '\\', '"': '"'}.get(nxt, nxt))
+                    i += 2
+                else:
+                    buf.append(text[i]); i += 1
+            i += 1
+            yield ''.join(buf); continue
+        # bare (unquoted) token — Steam writes these occasionally
+        j = i
+        while j < n and text[j] not in ' \t\r\n{}"':
+            j += 1
+        yield text[i:j]; i = j
+
+def vdf_load(path):
+    """Parse a text VDF into nested dicts. Tolerant: unterminated blocks at EOF
+    are accepted, because a Steam config truncated by a crash is common and we
+    would rather read what is there than throw."""
+    with open(path, encoding='utf-8', errors='replace') as fh:
+        toks = list(vdf_tokens(fh.read()))
+    pos = 0
+    def parse_block():
+        nonlocal pos
+        out = {}
+        while pos < len(toks):
+            t = toks[pos]
+            if t == '}':
+                pos += 1; return out
+            pos += 1
+            if pos < len(toks) and toks[pos] == '{':
+                pos += 1
+                out[t] = parse_block()
+            elif pos < len(toks):
+                out[t] = toks[pos]; pos += 1
+            else:
+                out[t] = ''
+        return out
+    root = {}
+    while pos < len(toks):
+        t = toks[pos]; pos += 1
+        if pos < len(toks) and toks[pos] == '{':
+            pos += 1
+            root[t] = parse_block()
+        elif pos < len(toks):
+            root[t] = toks[pos]; pos += 1
+    return root
+
+def dig(d, *keys):
+    """Case-insensitive nested lookup — Steam is inconsistent about casing."""
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        for kk, vv in cur.items():
+            if kk.lower() == k.lower():
+                cur = vv; break
+        else:
+            return None
+    return cur
+
+# ------------------------------------------------------------ Steam discovery
+
+def steam_roots():
+    env = os.environ.get('TRUCKVR_STEAM_ROOT')
+    cands = [env] if env else []
+    home = os.path.expanduser('~')
+    xdg = os.environ.get('XDG_DATA_HOME') or os.path.join(home, '.local/share')
+    cands += [
+        os.path.join(xdg, 'Steam'),
+        os.path.join(xdg, 'steam'),
+        os.path.join(home, '.steam/steam'),
+        os.path.join(home, '.steam/root'),
+        os.path.join(home, '.steam/debian-installation'),
+        os.path.join(home, '.var/app/com.valvesoftware.Steam/data/Steam'),   # flatpak
+        os.path.join(home, 'snap/steam/common/.local/share/Steam'),          # snap
+        os.path.join(home, '.local/share/Steam'),
+    ]
+    seen, out = set(), []
+    for c in cands:
+        if not c:
+            continue
+        try:
+            real = os.path.realpath(c)
+        except OSError:
+            continue
+        if real in seen or not os.path.isdir(os.path.join(real, 'steamapps')):
+            continue
+        # A real Steam root has one of these; a bare steamapps dir does not.
+        if not (os.path.exists(os.path.join(real, 'config/config.vdf'))
+                or os.path.exists(os.path.join(real, 'steamapps/libraryfolders.vdf'))):
+            continue
+        seen.add(real); out.append(real)
+    return out
+
+def libraries(root):
+    """Every Steam library folder, the root itself first."""
+    out = [root]
+    lf = os.path.join(root, 'steamapps/libraryfolders.vdf')
+    if os.path.exists(lf):
+        try:
+            d = vdf_load(lf)
+            folders = dig(d, 'libraryfolders') or {}
+            for _, v in sorted(folders.items()):
+                p = v.get('path') if isinstance(v, dict) else v
+                if p and os.path.isdir(p):
+                    out.append(p)
+        except Exception:
+            pass
+    seen, uniq = set(), []
+    for p in out:
+        r = os.path.realpath(p)
+        if r not in seen:
+            seen.add(r); uniq.append(p)
+    return uniq
+
+def app_manifest(root, appid):
+    """(library_path, parsed_acf) for an installed app, or (None, None)."""
+    for lib in libraries(root):
+        acf = os.path.join(lib, 'steamapps', f'appmanifest_{appid}.acf')
+        if os.path.exists(acf):
+            try:
+                return lib, dig(vdf_load(acf), 'AppState') or {}
+            except Exception:
+                return lib, {}
+    return None, None
+
+def compatdata(root, appid):
+    """compatdata lives beside the game, but not always — check every library."""
+    for lib in libraries(root):
+        p = os.path.join(lib, 'steamapps/compatdata', str(appid))
+        if os.path.isdir(p):
+            return p
+    return None
+
+# ------------------------------------------------------- Proton discovery
+
+def proton_dirs(root):
+    dirs = []
+    home = os.path.expanduser('~')
+    xdg = os.environ.get('XDG_DATA_HOME') or os.path.join(home, '.local/share')
+    ct_roots = [
+        os.path.join(root, 'compatibilitytools.d'),
+        os.path.join(home, '.steam/root/compatibilitytools.d'),
+        os.path.join(xdg, 'Steam/compatibilitytools.d'),
+        os.path.join(home, '.var/app/com.valvesoftware.Steam/data/Steam/compatibilitytools.d'),
+        '/usr/share/steam/compatibilitytools.d',
+        '/usr/local/share/steam/compatibilitytools.d',
+    ]
+    # Steam and SteamTinkerLaunch both honour this, so a Proton reachable only
+    # through it is a perfectly normal choice the tool must be able to see.
+    for extra in (os.environ.get('STEAM_EXTRA_COMPAT_TOOLS_PATHS') or '').split(':'):
+        if extra.strip():
+            ct_roots.append(extra.strip())
+    for cr in ct_roots:
+        if os.path.isdir(cr):
+            for name in sorted(os.listdir(cr)):
+                dirs.append(os.path.join(cr, name))
+    # Valve-shipped Proton lives in whichever library it was installed to, and
+    # people drop third-party builds in there too. Do not filter by name — a
+    # directory called "GE-Proton12-1" is just as valid as "Proton 11.0", and
+    # the signature check below is what actually decides.
+    for lib in libraries(root):
+        common = os.path.join(lib, 'steamapps/common')
+        if os.path.isdir(common):
+            try:
+                for name in sorted(os.listdir(common)):
+                    dirs.append(os.path.join(common, name))
+            except OSError:
+                pass
+    seen, out = set(), []
+    for d in dirs:
+        r = os.path.realpath(d)
+        if r in seen or not os.path.isdir(d):
+            continue
+        # A Proton dist has a `proton` launcher script and a files/ (or dist/) tree.
+        if not os.path.exists(os.path.join(d, 'proton')):
+            continue
+        if not (os.path.isdir(os.path.join(d, 'files')) or os.path.isdir(os.path.join(d, 'dist'))):
+            continue
+        seen.add(r); out.append(d)
+    return out
+
+def proton_aliases(root, d):
+    """Every name Steam or SteamTinkerLaunch might refer to this dist by.
+
+    Order matters: the first alias that yields a definite VR verdict wins, so
+    the most trustworthy name goes first. The per-dist `version` file is LAST
+    because it is demonstrably unreliable — some proton-cachyos builds ship a
+    `version` naming a completely different, much older Proton."""
+    names = [os.path.basename(d.rstrip('/'))]
+
+    ctv = os.path.join(d, 'compatibilitytool.vdf')
+    if os.path.exists(ctv):
+        try:
+            tools = dig(vdf_load(ctv), 'compatibilitytools', 'compat_tools')
+            if isinstance(tools, dict):
+                names += list(tools.keys())
+        except Exception:
+            pass
+
+    # Valve dists have no internal name; Steam keys them by appid. Recover the
+    # store name and install dir from the app manifest sitting next to them.
+    parent = os.path.dirname(os.path.dirname(d.rstrip('/')))   # .../steamapps
+    if os.path.basename(parent) == 'steamapps':
+        base = os.path.basename(d.rstrip('/'))
+        for acf in sorted(_glob_acf(parent)):
+            try:
+                st = dig(vdf_load(acf), 'AppState') or {}
+            except Exception:
+                continue
+            if st.get('installdir') == base:
+                nm = st.get('name') or ''
+                if nm:
+                    names.append(nm)
+                    # Steam's internal ids look like "proton_experimental", "proton_9".
+                    names.append(re.sub(r'[^a-z0-9]+', '_', nm.lower()).strip('_'))
+                break
+
+    ver = os.path.join(d, 'version')
+    if os.path.exists(ver):
+        try:
+            parts = open(ver, encoding='utf-8', errors='replace').read().split()
+            if len(parts) >= 2:
+                names.append(parts[1])
+            elif parts:
+                names.append(parts[0])
+        except Exception:
+            pass
+
+    seen, out = set(), []
+    for n in names:
+        n = n.strip()
+        if n and n.lower() not in seen:
+            seen.add(n.lower()); out.append(n)
+    return out
+
+def _glob_acf(steamapps):
+    try:
+        return [os.path.join(steamapps, f) for f in os.listdir(steamapps)
+                if f.startswith('appmanifest_') and f.endswith('.acf')]
+    except OSError:
+        return []
+
+FIX_DATE = 20260707
+FIX_GE = (11, 3)
+
+def vr_verdict(names):
+    """('yes'|'no'|'unknown', reason) — does this build have Proton PR #9915?
+
+    Deliberately NOT based on file timestamps: mtimes on a Proton dist reflect
+    when it was downloaded or extracted, not when it was built. A cachyos build
+    stamped 20260703 (no fix) can easily carry an mtime weeks after the fix
+    date, and Steam re-touches files in its own dists. Only names carry real
+    build identity."""
+    for nm in names:
+        n = nm.strip().lower()
+
+        m = re.match(r'^ge-proton(\d+)-(\d+)', n)
+        if m:
+            v = (int(m.group(1)), int(m.group(2)))
+            if v >= FIX_GE:
+                return 'yes', f'{nm} >= GE-Proton{FIX_GE[0]}-{FIX_GE[1]}'
+            return 'no', f'{nm} predates GE-Proton{FIX_GE[0]}-{FIX_GE[1]}'
+
+        # Date-stamped builds: experimental-11.0-20260713, cachyos-...-20260703,
+        # proton-tkg-..-20260801, and friends.
+        m = re.search(r'(20\d{6})', n)
+        if m:
+            d = int(m.group(1))
+            if 20150101 <= d <= 20991231:
+                if d >= FIX_DATE:
+                    return 'yes', f'{nm} built {m.group(1)} (>= {FIX_DATE})'
+                return 'no', f'{nm} built {m.group(1)} (< {FIX_DATE})'
+
+        # Valve stable: proton-11.0-1, "Proton 11.0", proton_10.
+        m = re.match(r'^proton[-_ ]+(\d+)(?:\.(\d+))?', n)
+        if m and 'experimental' not in n:
+            major = int(m.group(1))
+            if major >= 12:
+                return 'yes', f'{nm} is Proton {major}.x'
+            return 'no', f'{nm} is Proton {major}.x — the fix is not backported'
+
+    return 'unknown', 'no recognisable version in ' + ', '.join(names[:3])
+
+# --------------------------------------------------- which Proton runs an app
+
+STL_NAMES = {'proton-stl', 'steamtinkerlaunch'}
+
+def stl_config_dir():
+    xdg = os.environ.get('XDG_CONFIG_HOME') or os.path.expanduser('~/.config')
+    for c in (os.path.join(xdg, 'steamtinkerlaunch'),
+              os.path.expanduser('~/.config/steamtinkerlaunch'),
+              os.path.expanduser('~/.var/app/com.valvesoftware.Steam/config/steamtinkerlaunch')):
+        if os.path.isdir(c):
+            return c
+    return None
+
+def stl_useproton(appid):
+    """SteamTinkerLaunch's own Proton choice: per-game first, then global."""
+    cd = stl_config_dir()
+    if not cd:
+        return None, None
+    for path in (os.path.join(cd, 'gamecfgs/id', f'{appid}.conf'),
+                 os.path.join(cd, 'global.conf')):
+        if not os.path.exists(path):
+            continue
+        try:
+            for line in open(path, encoding='utf-8', errors='replace'):
+                m = re.match(r'^\s*USEPROTON="?(.*?)"?\s*$', line)
+                if m and m.group(1).strip():
+                    return m.group(1).strip(), path
+        except OSError:
+            pass
+    return None, cd
+
+def compat_mapping(root, appid):
+    """(tool_name, source) from Steam's per-app override, else the global default."""
+    cfg = os.path.join(root, 'config/config.vdf')
+    if not os.path.exists(cfg):
+        return None, None
+    try:
+        d = vdf_load(cfg)
+    except Exception:
+        return None, None
+    mapping = dig(d, 'InstallConfigStore', 'Software', 'Valve', 'Steam', 'CompatToolMapping')
+    if not isinstance(mapping, dict):
+        return None, None
+    ent = mapping.get(str(appid))
+    if isinstance(ent, dict) and ent.get('name'):
+        return ent['name'], f'Steam CompatToolMapping[{appid}]'
+    ent = mapping.get('0')
+    if isinstance(ent, dict) and ent.get('name'):
+        return ent['name'], 'Steam global Steam Play default'
+    return None, None
+
+def resolve_proton(root, appid):
+    """Work out which Proton dist will actually run this appid.
+
+    Two levels of indirection are normal: Steam may map the game to a wrapper
+    tool (SteamTinkerLaunch registers itself as "Proton-stl"), and the wrapper
+    then picks the real Proton from its own config."""
+    chain = []
+    name, src = compat_mapping(root, appid)
+    if name:
+        chain.append(f'{src} -> {name}')
+    wrapper = None
+    if name and name.lower() in STL_NAMES:
+        wrapper = name
+        stl_name, stl_src = stl_useproton(appid)
+        if stl_name:
+            chain.append(f'{os.path.basename(stl_src or "stl")} USEPROTON -> {stl_name}')
+            name = stl_name
+        else:
+            chain.append('SteamTinkerLaunch USEPROTON is unset')
+            name = None
+
+    dirs = proton_dirs(root)
+    alias_map = {}
+    for d in dirs:
+        for a in proton_aliases(root, d):
+            alias_map.setdefault(a.lower(), d)
+
+    path = alias_map.get((name or '').lower()) if name else None
+    if not path and name:
+        # Tolerate a directory that was renamed after Steam recorded the name.
+        for a, d in alias_map.items():
+            if a.replace(' ', '').replace('-', '').replace('_', '') == \
+               name.lower().replace(' ', '').replace('-', '').replace('_', ''):
+                path = d; break
+    if path:
+        verdict, reason = vr_verdict(proton_aliases(root, path))
+    elif name:
+        # The directory is gone, but the name Steam recorded is still enough to
+        # judge the build — say so rather than shrugging.
+        verdict, reason = vr_verdict([name])
+    else:
+        verdict, reason = ('unknown', 'no Proton resolved')
+    return {
+        'name': name or '',
+        'wrapper': wrapper or '',
+        'dir': path or '',
+        'chain': chain,
+        'vr': verdict,
+        'reason': reason,
+    }
+
+# ------------------------------------------------------- setupapi stub patch
+#
+# SetupDiGetDeviceInterfaceAlias is `@ stub` in setupapi.spec, so winebuild
+# emits a thunk that calls __wine_spec_unimplemented_stub, which raises
+# EXCEPTION_WINE_STUB (0x80000100) and takes the process down. Returning FALSE
+# instead is the documented "no alias exists" answer and callers handle it.
+
+TARGET = b'SetupDiGetDeviceInterfaceAlias'
+STUB64  = b'\x48\x83\xec\x28'          # sub rsp,0x28
+PATCH64 = b'\x31\xc0\xc3'              # xor eax,eax ; ret
+# 32-bit builds pad the entry with hotpatch NOPs, and the export is stdcall
+# with four pointer arguments, so the return must pop 16 bytes of stack.
+STUB32  = b'\x90' * 9 + b'\x83\xec'    # nop*9 ; sub esp,N
+PATCH32 = b'\x31\xc0\xc2\x10\x00'      # xor eax,eax ; ret 0x10
+
+class PE:
+    """Just enough PE reader to find one export and read the code at it."""
+
+    def __init__(self, data):
+        self.d = data
+        e = struct.unpack_from('<I', data, 0x3C)[0]
+        if not (0 < e < len(data) - 24) or data[e:e+4] != b'PE\0\0':
+            raise ValueError('not a PE file')
+        self.e = e
+        n_sec  = struct.unpack_from('<H', data, e + 6)[0]
+        sz_opt = struct.unpack_from('<H', data, e + 20)[0]
+        magic  = struct.unpack_from('<H', data, e + 24)[0]
+        if magic == 0x20B:
+            self.bits, self.dd, self.n_dd = 64, e + 24 + 112, e + 24 + 108
+        elif magic == 0x10B:
+            self.bits, self.dd, self.n_dd = 32, e + 24 + 96, e + 24 + 92
+        else:
+            raise ValueError(f'unknown PE magic {magic:#x}')
+        self.secs = []
+        for i in range(n_sec):
+            o = e + 24 + sz_opt + i * 40
+            if o + 40 > len(data):
+                break
+            vsize, vaddr, rawsize, rawptr = struct.unpack_from('<IIII', data, o + 8)
+            self.secs.append((vaddr, vsize, rawptr, rawsize))
+
+    def r2o(self, rva):
+        for vaddr, vsize, rawptr, rawsize in self.secs:
+            if vaddr <= rva < vaddr + max(vsize, rawsize):
+                off = rawptr + (rva - vaddr)
+                # A virtual-only tail (.bss) has no bytes on disk.
+                return off if 0 <= off < len(self.d) else None
+        return None
+
+    def o2r(self, off):
+        for vaddr, vsize, rawptr, rawsize in self.secs:
+            if rawptr <= off < rawptr + rawsize:
+                return vaddr + (off - rawptr)
+        return None
+
+    def cstr(self, off):
+        if off is None:
+            return b''
+        end = self.d.find(b'\0', off)
+        return bytes(self.d[off:end]) if 0 <= end else b''
+
+    def find_export(self, target):
+        """File offset of a named export. Raises for a forwarder."""
+        if struct.unpack_from('<I', self.d, self.n_dd)[0] < 1:
+            return None
+        exp_rva  = struct.unpack_from('<I', self.d, self.dd)[0]
+        exp_size = struct.unpack_from('<I', self.d, self.dd + 4)[0]
+        if not exp_rva:
+            return None
+        eo = self.r2o(exp_rva)
+        if eo is None:
+            return None
+        n_names = struct.unpack_from('<I', self.d, eo + 24)[0]
+        a_f, a_n, a_o = struct.unpack_from('<III', self.d, eo + 28)
+        if not (a_f and a_n and a_o):
+            return None
+        of, on, oo = self.r2o(a_f), self.r2o(a_n), self.r2o(a_o)
+        if None in (of, on, oo):
+            return None
+        for i in range(n_names):
+            no = self.r2o(struct.unpack_from('<I', self.d, on + i * 4)[0])
+            if self.cstr(no) != target:
+                continue
+            ordn = struct.unpack_from('<H', self.d, oo + i * 2)[0]
+            frva = struct.unpack_from('<I', self.d, of + ordn * 4)[0]
+            # An RVA inside the export directory is a forwarder string, not code.
+            if exp_rva <= frva < exp_rva + exp_size:
+                raise ValueError('forwarded to ' + self.cstr(self.r2o(frva)).decode('ascii', 'replace'))
+            return self.r2o(frva)
+        return None
+
+def stub_verify(pe, off):
+    """True only if the code at `off` really is winebuild's unimplemented-stub
+    thunk for our target.
+
+    Checking just the prologue is not good enough: `sub rsp,0x28` opens a few
+    hundred of the ordinary functions in this same DLL, so a build that finally
+    *implements* SetupDiGetDeviceInterfaceAlias would look identical to a stub
+    and get its first three bytes replaced with a `return FALSE` — silently
+    breaking working code. So decode the thunk instead and require that it
+    loads the module name and the function name and then calls something:
+
+        48 83 ec 28              sub  rsp,0x28
+        48 8d 0d <rel32>         lea  rcx,[rip+x]   -> "setupapi.dll"
+        48 8d 15 <rel32>         lea  rdx,[rip+y]   -> "SetupDiGetDeviceInterfaceAlias"
+        e8       <rel32>         call __wine_spec_unimplemented_stub
+    """
+    d = pe.d
+    if pe.bits != 64:
+        return False
+    if bytes(d[off:off+4]) != STUB64:
+        return False
+    if bytes(d[off+4:off+7]) != b'\x48\x8d\x0d' or bytes(d[off+11:off+14]) != b'\x48\x8d\x15':
+        return False
+    if d[off+18] != 0xE8:
+        return False
+    seen = []
+    for ins in (off + 4, off + 11):
+        rva = pe.o2r(ins)
+        if rva is None:
+            return False
+        rel = struct.unpack_from('<i', d, ins + 3)[0]
+        seen.append(pe.cstr(pe.r2o(rva + 7 + rel)))
+    mod, fn = seen
+    return mod.lower().startswith(b'setupapi') and fn == TARGET
+
+def dll_state(path):
+    if not os.path.exists(path):
+        return 'MISSING'
+    try:
+        data = open(path, 'rb').read()
+        pe = PE(data)
+        off = pe.find_export(TARGET)
+    except ValueError as ex:
+        if 'forwarded' in str(ex):
+            return 'FORWARDED'          # nothing to patch; the alias lives elsewhere
+        return f'ERROR {ex}'
+    except Exception as ex:
+        return f'ERROR {ex}'
+    if off is None:
+        return 'NOEXPORT'
+    head = data[off:off+16]
+    if pe.bits == 64:
+        if head[:3] == PATCH64:            return 'PATCHED'
+        if stub_verify(pe, off):           return 'UNPATCHED'
+        if head[:4] == STUB64:             return 'IMPLEMENTED'   # real code, leave alone
+    else:
+        if head[:5] == PATCH32:            return 'PATCHED32'
+        if head[:11] == STUB32:            return 'UNPATCHED32'
+    return 'FOREIGN ' + ' '.join(f'{b:02x}' for b in head[:8])
+
+def _write_through(path, data):
+    """Replace a file's contents atomically, following symlinks.
+
+    Prefix DLLs are frequently symlinks into a shared Proton dist. Writing a
+    temp file and renaming it over the *link* would silently convert the link
+    into a regular file and leave the real dist untouched; resolving first
+    keeps the semantics the user expects. The temp file is created in the
+    target's own directory so the rename cannot cross filesystems."""
+    real = os.path.realpath(path)
+    d = os.path.dirname(real)
+    mode = os.stat(real).st_mode
+    fd, tmp = tempfile.mkstemp(dir=d, prefix='.truckvr-', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'wb') as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode & 0o7777)
+        os.replace(tmp, real)
+    except BaseException:
+        try: os.unlink(tmp)
+        except OSError: pass
+        raise
+    return real
+
+def dll_patch(path, allow32=False):
+    real = os.path.realpath(path)
+    data = bytearray(open(real, 'rb').read())
+    pe = PE(data)
+    off = pe.find_export(TARGET)
+    if off is None:
+        return 'no SetupDiGetDeviceInterfaceAlias export — nothing to do'
+    head = bytes(data[off:off+16])
+
+    if pe.bits == 32:
+        if head[:5] == PATCH32:
+            return 'already patched'
+        if not allow32:
+            return 'skipped (32-bit; the games and TruckersMP are 64-bit)'
+        if head[:11] != STUB32:
+            raise SystemExit('unexpected bytes at %#x (%s) — refusing to patch'
+                             % (off, ' '.join(f'{b:02x}' for b in head[:8])))
+        patch = PATCH32
+    else:
+        if head[:3] == PATCH64:
+            return 'already patched'
+        if not stub_verify(pe, off):
+            if head[:4] == STUB64:
+                return ('looks like a real implementation, not a stub — '
+                        'leaving it alone (this build may not need the patch)')
+            raise SystemExit('unexpected bytes at %#x (%s) — refusing to patch'
+                             % (off, ' '.join(f'{b:02x}' for b in head[:8])))
+        patch = PATCH64
+
+    bak = dll_backup(real)
+    if not bak:
+        bak = real + '.truckvr-orig'
+        shutil.copy2(real, bak)
+    data[off:off+len(patch)] = patch
+    _write_through(real, bytes(data))
+    return 'patched at %#x (%d-bit, backup %s)' % (off, pe.bits, os.path.basename(bak))
+
+def dll_backup(path):
+    """The original-DLL backup for this file, if one exists.
+
+    `.prevr` is what the author's earlier per-game scripts used; honour it so an
+    upgrade does not strand people with a patched DLL and no way back."""
+    real = os.path.realpath(path)
+    for suffix in ('.truckvr-orig', '.prevr'):
+        if os.path.exists(real + suffix):
+            return real + suffix
+    return None
+
+def dll_unpatch(path):
+    """Undo the patch, with or without a backup file.
+
+    The patch overwrites a fixed-length prologue with another fixed-length one,
+    and the bytes it replaced are the same in every build — `sub rsp,0x28` on
+    64-bit, hotpatch NOPs on 32-bit. So the original can always be reconstructed
+    exactly, which matters because a Proton update deletes the backup that lived
+    inside the dist directory while leaving the patched DLL in place."""
+    real = os.path.realpath(path)
+    bak = dll_backup(path)
+    if bak:
+        shutil.copyfile(bak, real)
+        os.unlink(bak)
+        return 'restored from ' + os.path.basename(bak)
+
+    data = bytearray(open(real, 'rb').read())
+    try:
+        pe = PE(data)
+        off = pe.find_export(TARGET)
+    except Exception as ex:
+        return f'cannot read: {ex}'
+    if off is None:
+        return 'no export — nothing to undo'
+    head = bytes(data[off:off+len(PATCH64)])
+    if head == PATCH64 and pe.bits == 64:
+        data[off:off+len(STUB64)] = STUB64
+    elif bytes(data[off:off+len(PATCH32)]) == PATCH32 and pe.bits == 32:
+        data[off:off+len(PATCH32)] = b'\x90' * len(PATCH32)
+    else:
+        return 'not patched — left alone'
+    _write_through(real, bytes(data))
+    return 'restored the original prologue (no backup file was needed)'
+
+# ------------------------------------------------ TruckersMP launcher options
+
+def tmp_path(prefix):
+    """Locate TruckersMP's config inside a prefix.
+
+    Proton names the prefix user `steamuser`, but a prefix that was created by
+    plain Wine — or carried over from an older Proton — uses the real login
+    name instead, and both can be present at once. Take whichever actually has
+    the file; fall back to the conventional path so the caller has something
+    meaningful to print when TruckersMP has never run."""
+    tail = os.path.join('AppData/Roaming/TruckersMP', 'launcher-options.json')
+    users = os.path.join(prefix, 'drive_c/users')
+    default = os.path.join(users, 'steamuser', tail)
+    try:
+        names = sorted(os.listdir(users))
+    except OSError:
+        return default
+    names.sort(key=lambda n: n != 'steamuser')      # prefer steamuser on a tie
+    for n in names:
+        p = os.path.join(users, n, tail)
+        if os.path.exists(p):
+            return p
+    return default
+
+def tmp_get(path, key):
+    d = json.load(open(path, encoding='utf-8'))
+    g = (d.get('games') or {}).get(key) or {}
+    return g.get('consoleOpts') or []
+
+STRIPPED_KEY = '_truckvrStripped'
+
+def _pairs(opts):
+    """Group a flat option list into (flag, value) pairs.
+
+    SCS games take arguments as a separate token — `-rdevice gl` — so a bare
+    membership test would happily delete a *value* that happens to read like a
+    flag we care about, and shift the following token into its place. Pairing
+    first means every edit below operates on whole options."""
+    out, i = [], 0
+    while i < len(opts):
+        tok = opts[i]
+        if tok.startswith('-') and i + 1 < len(opts) and not opts[i+1].startswith('-'):
+            out.append((tok, opts[i+1])); i += 2
+        else:
+            out.append((tok, None)); i += 1
+    return out
+
+def _flatten(pairs):
+    out = []
+    for f, v in pairs:
+        out.append(f)
+        if v is not None:
+            out.append(v)
+    return out
+
+def tmp_set(path, key, enable, vr_flags):
+    d = json.load(open(path, encoding='utf-8'))
+    games = d.get('games')
+    if not isinstance(games, dict) or key not in games:
+        raise SystemExit(f"launcher-options.json has no games['{key}'] entry")
+    entry = games[key]
+    pairs = _pairs(list(entry.get('consoleOpts') or []))
+    vr = set(vr_flags)
+
+    stripped, restored = [], []
+    if enable:
+        # VR needs the DX11 renderer; a stored "-rdevice gl" silently disables
+        # it. Remember what we took away so `off` can hand it back — otherwise
+        # toggling VR once would quietly cost the user their renderer choice.
+        kept = []
+        for f, v in pairs:
+            if f in ('-rdevice', '-r_device') and (v or '').lower() in ('gl', 'opengl'):
+                stripped.append([f, v]); continue
+            if f in vr and v is None:
+                continue                    # re-added at the front below
+            kept.append((f, v))
+        prev = entry.get(STRIPPED_KEY) or []
+        if stripped or prev:
+            entry[STRIPPED_KEY] = stripped or prev
+        opts = list(vr_flags) + _flatten(kept)
+    else:
+        kept = [(f, v) for f, v in pairs if not (f in vr and v is None)]
+        for item in (entry.pop(STRIPPED_KEY, None) or []):
+            if isinstance(item, list) and item:
+                restored.append(item)
+        opts = _flatten(kept) + _flatten([(i[0], i[1] if len(i) > 1 else None)
+                                          for i in restored])
+
+    entry['consoleOpts'] = opts
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.truckvr-', suffix='.tmp')
+    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+        # TruckersMP writes this file compact; match it so a diff stays small.
+        json.dump(d, fh, separators=(',', ':'))
+        fh.flush(); os.fsync(fh.fileno())
+    # mkstemp creates 0600; without this the file silently loses group/other
+    # read access every time VR is toggled.
+    shutil.copystat(path, tmp)
+    os.replace(tmp, path)
+    return opts, [' '.join(x for x in s if x) for s in stripped], \
+           [' '.join(x for x in r if x) for r in restored]
+
+# ------------------------------------------------------- Steam launch options
+
+def localconfigs(root):
+    ud = os.path.join(root, 'userdata')
+    out = []
+    if os.path.isdir(ud):
+        for uid in sorted(os.listdir(ud)):
+            p = os.path.join(ud, uid, 'config/localconfig.vdf')
+            if os.path.exists(p):
+                out.append(p)
+    return out
+
+def launch_profiles(root, appid):
+    """The Steam profiles whose launch options are worth setting for this app.
+
+    A machine usually has several: the real account, plus `anonymous` and `0`
+    placeholders that Steam maintains. They all have an apps section, so the
+    only honest signal is whether a profile has an entry for THIS appid — Steam
+    creates one the first time that account sees the game. If none do (a fresh
+    install), fall back to every profile that has an apps section at all, so
+    setup still works before the first launch."""
+    owns, has_apps = [], []
+    for p in localconfigs(root):
+        try:
+            v = launch_get(p, appid)
+        except Exception:
+            continue
+        if v is None:
+            continue                       # no apps section — not a real profile
+        has_apps.append(p)
+        text = open(p, encoding='utf-8', errors='replace').read()
+        span = (0, len(text))
+        for key in ('UserLocalConfigStore', 'Software', 'Valve', 'Steam', 'apps'):
+            span = _find_section(text, key, span[0])
+        app = _find_section(text, str(appid), span[0])
+        if app and app[0] <= span[1]:
+            owns.append(p)
+    return owns or has_apps
+
+def _find_section(text, key, start):
+    """Byte range of the block belonging to "key" at or after `start`."""
+    m = re.compile(r'"%s"\s*\{' % re.escape(key), re.IGNORECASE).search(text, start)
+    if not m:
+        return None
+    depth, i = 1, m.end()
+    while i < len(text) and depth:
+        c = text[i]
+        if c == '"':                      # skip strings so braces inside cannot fool us
+            i += 1
+            while i < len(text) and text[i] != '"':
+                i += 2 if text[i] == '\\' else 1
+        elif c == '{': depth += 1
+        elif c == '}': depth -= 1
+        i += 1
+    return m.end(), i - 1
+
+def launch_get(path, appid):
+    """'' when the app has no launch options, None when this profile has no
+    apps section at all.
+
+    The distinction matters: Steam keeps placeholder profiles (`anonymous`, and
+    a `0` directory) whose localconfig.vdf is a couple of hundred bytes with no
+    apps in it. Writing launch options there accomplishes nothing and makes the
+    output look like something happened twice."""
+    text = open(path, encoding='utf-8', errors='replace').read()
+    span = (0, len(text))
+    for key in ('UserLocalConfigStore', 'Software', 'Valve', 'Steam', 'apps'):
+        span = _find_section(text, key, span[0])
+        if not span:
+            return None
+    app = _find_section(text, str(appid), span[0])
+    if not app or app[0] > span[1]:
+        return ''
+    m = re.search(r'"LaunchOptions"\s*"((?:[^"\\]|\\.)*)"', text[app[0]:app[1]], re.IGNORECASE)
+    return m.group(1) if m else ''
+
+def launch_set(path, appid, value):
+    """Set LaunchOptions for one app, touching nothing else in the file.
+
+    A targeted textual edit rather than parse-and-reserialise: localconfig.vdf
+    holds a lot of state we have no business rewriting, and Steam is picky
+    about it."""
+    text = open(path, encoding='utf-8', errors='replace').read()
+    esc = value.replace('\\', '\\\\').replace('"', '\\"')
+
+    span = (0, len(text))
+    trail = []
+    for key in ('UserLocalConfigStore', 'Software', 'Valve', 'Steam', 'apps'):
+        span = _find_section(text, key, span[0])
+        if not span:
+            raise SystemExit(f'could not find "{key}" in {path}')
+        trail.append(span)
+    app_span = _find_section(text, str(appid), span[0])
+
+    if app_span and app_span[0] < span[1]:
+        body = text[app_span[0]:app_span[1]]
+        m = re.search(r'"LaunchOptions"\s*"((?:[^"\\]|\\.)*)"', body, re.IGNORECASE)
+        if m:
+            new_body = body[:m.start()] + f'"LaunchOptions"\t\t"{esc}"' + body[m.end():]
+        else:
+            indent = '\t' * 6
+            new_body = '\n%s"LaunchOptions"\t\t"%s"' % (indent, esc) + body
+        new = text[:app_span[0]] + new_body + text[app_span[1]:]
+    else:
+        indent = '\t' * 5
+        block = ('\n%s"%s"\n%s{\n%s\t"LaunchOptions"\t\t"%s"\n%s}'
+                 % (indent, appid, indent, indent, esc, indent))
+        new = text[:span[1]] + block + text[span[1]:]
+
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.truckvr-', suffix='.tmp')
+    with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+        fh.write(new); fh.flush(); os.fsync(fh.fileno())
+    shutil.copystat(path, tmp)     # mkstemp is 0600; keep Steam's own mode
+    os.replace(tmp, path)
+    return True
+
+# ------------------------------------------------------------ WiVRn discovery
+
+def wivrn_lib():
+    """Absolute path to libopenxr_wivrn.so, whichever way WiVRn was installed.
+
+    Absolute is not optional: WiVRn's own flatpak manifest uses a relative
+    library_path, which resolves against the manifest's directory. Copying or
+    symlinking that manifest into ~/.config breaks it."""
+    home = os.path.expanduser('~')
+    xdg = os.environ.get('XDG_DATA_HOME') or os.path.join(home, '.local/share')
+    pats = [
+        os.path.join(xdg, 'flatpak/app/io.github.wivrn.wivrn/current/active/files/lib/wivrn'),
+        os.path.join(home, '.local/share/flatpak/app/io.github.wivrn.wivrn/current/active/files/lib/wivrn'),
+        '/var/lib/flatpak/app/io.github.wivrn.wivrn/current/active/files/lib/wivrn',
+        '/usr/lib/wivrn', '/usr/lib64/wivrn', '/usr/local/lib/wivrn',
+        '/usr/lib/x86_64-linux-gnu/wivrn', '/usr/lib', '/usr/lib64', '/usr/local/lib',
+        os.path.join(home, '.local/lib/wivrn'), os.path.join(home, '.local/lib'),
+    ]
+    for d in pats:
+        p = os.path.join(d, 'libopenxr_wivrn.so')
+        if os.path.exists(p):
+            return os.path.realpath(p)
+    # Last resort: an AppImage or a hand-built tree somewhere under $HOME. Kept
+    # shallow and last because it walks the filesystem.
+    import glob as _glob
+    for pat in (os.path.join(home, '.local/share/*/lib*/wivrn/libopenxr_wivrn.so'),
+                os.path.join(home, 'Applications/*/lib*/libopenxr_wivrn.so'),
+                os.path.join(home, '*/lib*/wivrn/libopenxr_wivrn.so')):
+        hits = sorted(_glob.glob(pat))
+        if hits:
+            return os.path.realpath(hits[0])
+    return None
+
+def write_xr_runtime(dest):
+    lib = wivrn_lib()
+    if not lib:
+        return None
+    monado = os.path.join(os.path.dirname(lib), 'libmonado_wivrn.so')
+    rt = {'name': 'WiVRn', 'library_path': lib}
+    if os.path.exists(monado):
+        rt['MND_libmonado_path'] = os.path.realpath(monado)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    if os.path.lexists(dest):
+        os.unlink(dest)                    # may be a symlink SteamVR left behind
+    with open(dest, 'w', encoding='utf-8') as fh:
+        json.dump({'file_format_version': '1.0.0', 'runtime': rt}, fh, indent=4)
+        fh.write('\n')
+    return lib
+
+# --------------------------------------------------------------------- driver
+
+def main():
+    cmd = sys.argv[1]
+    a = sys.argv[2:]
+
+    if cmd == 'roots':
+        print('\n'.join(steam_roots()))
+    elif cmd == 'libs':
+        print('\n'.join(libraries(a[0])))
+    elif cmd == 'app':
+        lib, st = app_manifest(a[0], a[1])
+        if not lib:
+            sys.exit(1)
+        installdir = (st or {}).get('installdir') or ''
+        print(json.dumps({
+            'library': lib,
+            'installdir': os.path.join(lib, 'steamapps/common', installdir) if installdir else '',
+            'compatdata': compatdata(a[0], a[1]) or '',
+            'name': (st or {}).get('name') or '',
+        }))
+    elif cmd == 'protons':
+        out = []
+        for d in proton_dirs(a[0]):
+            names = proton_aliases(a[0], d)
+            v, r = vr_verdict(names)
+            out.append({'dir': d, 'names': names, 'vr': v, 'reason': r})
+        print(json.dumps(out))
+    elif cmd == 'resolve':
+        print(json.dumps(resolve_proton(a[0], a[1])))
+    elif cmd == 'verdict':
+        # Exposed so the test suite can exercise the capability rule against
+        # build names that are not installed on this machine.
+        v, r = vr_verdict(a)
+        print(f'{v}\t{r}')
+    elif cmd == 'dll-state':
+        print(dll_state(a[0]))
+    elif cmd == 'dll-offset':
+        pe = PE(open(a[0], 'rb').read())
+        off = pe.find_export(TARGET)
+        if off is None:
+            sys.exit(1)
+        print(off)
+    elif cmd == 'dll-patch':
+        print(dll_patch(a[0], allow32=(len(a) > 1 and a[1] == '32')))
+    elif cmd == 'dll-unpatch':
+        print(dll_unpatch(a[0]))
+    elif cmd == 'dll-backup':
+        b = dll_backup(a[0])
+        if not b:
+            sys.exit(1)
+        print(b)
+    elif cmd == 'tmp-path':
+        print(tmp_path(a[0]))
+    elif cmd == 'tmp-get':
+        print(' '.join(tmp_get(a[0], a[1])))
+    elif cmd == 'tmp-set':
+        opts, stripped, restored = tmp_set(a[0], a[1], a[2] == '1', a[3:])
+        print(json.dumps({'opts': opts, 'stripped': stripped, 'restored': restored}))
+    elif cmd == 'localconfigs':
+        print('\n'.join(localconfigs(a[0])))
+    elif cmd == 'launch-profiles':
+        print('\n'.join(launch_profiles(a[0], a[1])))
+    elif cmd == 'launch-get':
+        v = launch_get(a[0], a[1])
+        if v is None:
+            sys.exit(1)
+        print(v)
+    elif cmd == 'launch-set':
+        launch_set(a[0], a[1], a[2])
+    elif cmd == 'wivrn-lib':
+        p = wivrn_lib()
+        if not p:
+            sys.exit(1)
+        print(p)
+    elif cmd == 'xr-write':
+        p = write_xr_runtime(a[0])
+        if not p:
+            sys.exit(1)
+        print(p)
+    elif cmd == 'xr-state':
+        path = a[0]
+        if not os.path.lexists(path):
+            print('MISSING'); return
+        try:
+            d = json.load(open(path, encoding='utf-8'))
+            nm = (d.get('runtime') or {}).get('name', '')
+            lib = (d.get('runtime') or {}).get('library_path', '')
+        except Exception:
+            print('BROKEN'); return
+        blob = (nm + ' ' + lib).lower()
+        if 'wivrn' in blob:
+            print('WIVRN ' + lib)
+        elif 'steamvr' in blob or 'monado' in blob:
+            print(('STEAMVR ' if 'steamvr' in blob else 'MONADO ') + lib)
+        else:
+            print('OTHER ' + (nm or lib))
+    elif cmd == 'stl-set-proton':
+        cd = stl_config_dir()
+        if not cd:
+            sys.exit(1)
+        path = os.path.join(cd, 'gamecfgs/id', f'{a[0]}.conf')
+        if not os.path.exists(path):
+            sys.exit(1)
+        lines = open(path, encoding='utf-8', errors='replace').read().splitlines(keepends=True)
+        done = False
+        for i, ln in enumerate(lines):
+            if re.match(r'^\s*USEPROTON=', ln):
+                lines[i] = f'USEPROTON="{a[1]}"\n'; done = True
+        if not done:
+            lines.append(f'USEPROTON="{a[1]}"\n')
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix='.truckvr-')
+        with os.fdopen(fd, 'w', encoding='utf-8') as fh:
+            fh.writelines(lines)
+        shutil.copystat(path, tmp)
+        os.replace(tmp, path)
+        print(path)
+    else:
+        sys.exit(f'unknown engine command {cmd}')
+
+main()
+PYEOF
+
+py() { python3 -c "$PY_ENGINE" "$@"; }
+
+# --------------------------------------------------------------- option parsing
+
+CMD=""
+GAMES=()
+OPT_ALL_PROTONS=0
+OPT_DRY=0
+OPT_YES=0
+OPT_32=0
+OPT_PROTON=""
+
+usage() {
+  cat <<EOF
+${c_hd}truckvr $VERSION${c_off} — ETS2 / ATS VR on Linux via WiVRn (+ TruckersMP)
+
+${c_hd}USAGE${c_off}
+  $SELF [options] <command> [ets2|ats|both]
+
+${c_hd}COMMANDS${c_off}
+  doctor        diagnose every part of the stack and say what is wrong (default)
+  install       do whatever is needed to make VR work, then diagnose
+  on            enable VR for the next launch
+  off           back to flat (monitor) mode
+  patch         (re)apply the setupapi stub patch TruckersMP needs
+  runtime       point OpenXR at WiVRn (fixes "no headset" after SteamVR ran)
+  protons       list installed Protons and whether each one can do VR
+  revert        undo everything this script changed
+  version       print the version
+
+${c_hd}OPTIONS${c_off}
+  --game G      ets2 | ats | both              (default: both)
+  --proton NAME use this Proton instead of the detected one
+  --all-protons patch every installed Proton, not just the active one
+  --include-32  also patch 32-bit setupapi.dll (not needed for these games)
+  --dry-run     say what would change, change nothing
+  --yes         do not ask for confirmation
+  --no-color    plain output
+
+${c_hd}TYPICAL FIRST RUN${c_off}
+  $SELF install            # then start WiVRn, connect the headset, launch from Steam
+
+${c_hd}IN GAME${c_off}
+  F11 toggles VR, F12 recenters. The headset shows the WiVRn lobby for the
+  first ~35s while the game boots — that is normal, not a failure.
+
+${c_hd}ENVIRONMENT${c_off}
+  TRUCKVR_STEAM_ROOT   override Steam autodetection
+EOF
+}
+
+while (( $# )); do
+  case "$1" in
+    --game)        GAMES=(); [[ "${2:-}" == both ]] && GAMES=("${GAMES_ALL[@]}") || GAMES=("${2:-}"); shift 2 ;;
+    --game=*)      v="${1#*=}"; [[ "$v" == both ]] && GAMES=("${GAMES_ALL[@]}") || GAMES=("$v"); shift ;;
+    --proton)      OPT_PROTON="${2:-}"; shift 2 ;;
+    --proton=*)    OPT_PROTON="${1#*=}"; shift ;;
+    --all-protons) OPT_ALL_PROTONS=1; shift ;;
+    --include-32)  OPT_32=1; shift ;;
+    --dry-run|-n)  OPT_DRY=1; shift ;;
+    --yes|-y)      OPT_YES=1; shift ;;
+    --no-color)    use_color=0; setup_color; shift ;;
+    -h|--help|help) usage; exit 0 ;;
+    -V|--version)  printf 'truckvr %s\n' "$VERSION"; exit 0 ;;
+    -*)            die "unknown option '$1' (try $SELF --help)" ;;
+    ets2|ats)      GAMES+=("$1"); shift ;;
+    both|all)      GAMES=("${GAMES_ALL[@]}"); shift ;;
+    *)             [[ -z "$CMD" ]] && CMD="$1" || die "unexpected argument '$1'"; shift ;;
+  esac
+done
+
+CMD="${CMD:-doctor}"
+(( ${#GAMES[@]} )) || GAMES=("${GAMES_ALL[@]}")
+for g in "${GAMES[@]}"; do
+  [[ -n "${GAME_APPID[$g]:-}" ]] || die "unknown game '$g' (use ets2, ats or both)"
+done
+
+command -v python3 >/dev/null 2>&1 || die "python3 is required but was not found in PATH"
+# Associative arrays and ${var/#pat} are used throughout.
+[[ -n "${BASH_VERSINFO:-}" && ${BASH_VERSINFO[0]} -ge 4 ]] \
+  || die "bash 4.0+ is required (this is ${BASH_VERSION:-unknown}).
+On macOS-style setups run it explicitly:  bash $SELF ..."
+
+# ------------------------------------------------------------------- discovery
+
+STEAM_ROOT=""
+discover_steam() {
+  local roots
+  roots="$(py roots 2>/dev/null || true)"
+  [[ -n "$roots" ]] || die "no Steam installation found.
+Looked in ~/.local/share/Steam, ~/.steam/{steam,root}, the Flatpak and Snap
+locations. If Steam lives somewhere else, set TRUCKVR_STEAM_ROOT."
+  STEAM_ROOT="$(head -1 <<<"$roots")"
+  local count; count="$(wc -l <<<"$roots")"
+  (( count > 1 )) && EXTRA_ROOTS="$(tail -n +2 <<<"$roots")" || EXTRA_ROOTS=""
+}
+
+# Cache per-game facts so we resolve each one only once.
+declare -A G_APPID G_PREFIX G_TMP G_PROTON_DIR G_PROTON_NAME G_VR G_VR_WHY G_CHAIN G_INSTALL
+
+load_game() {
+  local g="$1" appid="${GAME_APPID[$1]}" info
+  [[ -n "${G_APPID[$g]:-}" ]] && return 0
+  G_APPID[$g]=$appid
+  info="$(py app "$STEAM_ROOT" "$appid" 2>/dev/null || echo '{}')"
+  G_INSTALL[$g]="$(py_json "$info" installdir)"
+  local cd; cd="$(py_json "$info" compatdata)"
+  G_PREFIX[$g]="${cd:+$cd/pfx}"
+  G_TMP[$g]=""
+  [[ -n "${G_PREFIX[$g]}" ]] && G_TMP[$g]="$(py tmp-path "${G_PREFIX[$g]}")"
+
+  local res; res="$(py resolve "$STEAM_ROOT" "$appid" 2>/dev/null || echo '{}')"
+  G_PROTON_NAME[$g]="$(py_json "$res" name)"
+  G_PROTON_DIR[$g]="$(py_json "$res" dir)"
+  G_VR[$g]="$(py_json "$res" vr)"
+  G_VR_WHY[$g]="$(py_json "$res" reason)"
+  G_CHAIN[$g]="$(py_json_list "$res" chain)"
+
+  if [[ -n "$OPT_PROTON" ]]; then
+    local pd
+    pd="$(py protons "$STEAM_ROOT" | python3 -c '
+import json,sys
+want=sys.argv[1].lower()
+for p in json.load(sys.stdin):
+    if any(n.lower()==want for n in p["names"]):
+        print(p["dir"]+"\t"+p["vr"]+"\t"+p["reason"]); break
+' "$OPT_PROTON")"
+    [[ -n "$pd" ]] || die "no installed Proton is called '$OPT_PROTON' (see: $SELF protons)"
+    IFS=$'\t' read -r G_PROTON_DIR[$g] G_VR[$g] G_VR_WHY[$g] <<<"$pd"
+    G_PROTON_NAME[$g]="$OPT_PROTON"
+    G_CHAIN[$g]="--proton override"
+  fi
+}
+
+py_json()      { python3 -c 'import json,sys; print((json.loads(sys.argv[1]) or {}).get(sys.argv[2]) or "")' "$1" "$2"; }
+py_json_list() { python3 -c 'import json,sys; print(" | ".join((json.loads(sys.argv[1]) or {}).get(sys.argv[2]) or []))' "$1" "$2"; }
+
+dist_dlls() {   # $1 = proton dir -> the 64-bit setupapi.dll it ships
+  local d="$1" f
+  [[ -n "$d" ]] || return 0
+  # Proton has shipped four different layouts; `dist/` is the pre-5.13 one and
+  # is still on disk in older builds. The copy under share/default_pfx is a
+  # symlink into these, so patching here also covers prefixes created later.
+  for f in "$d"/files/lib/wine/x86_64-windows/setupapi.dll \
+           "$d"/files/lib64/wine/x86_64-windows/setupapi.dll \
+           "$d"/dist/lib/wine/x86_64-windows/setupapi.dll \
+           "$d"/dist/lib64/wine/x86_64-windows/setupapi.dll; do
+    [[ -f "$f" ]] && { printf '%s\n' "$f"; return 0; }
+  done
+  return 0
+}
+
+# ------------------------------------------------------------------- processes
+
+wivrn_running()   { pgrep -x wivrn-server >/dev/null 2>&1 || pgrep -f '[w]ivrn-server' >/dev/null 2>&1; }
+steam_running()   { pgrep -x steam >/dev/null 2>&1 || pgrep -f '[s]teamwebhelper' >/dev/null 2>&1; }
+steamvr_running() { pgrep -f '[S]teamVR/bin.*(vrserver|vrmonitor|vrcompositor)' >/dev/null 2>&1; }
+game_running()    { local g; for g in "${GAMES[@]}"; do pgrep -f "[${GAME_EXE[$g]:0:1}]${GAME_EXE[$g]:1}" >/dev/null 2>&1 && return 0; done; return 1; }
+
+# --------------------------------------------------------------------- actions
+
+do_runtime() {
+  head_ "OpenXR runtime"
+  local state lib
+  state="$(py xr-state "$XR_RUNTIME")"
+  if [[ "$state" == WIVRN* ]]; then
+    ok "already pointing at WiVRn"
+    return 0
+  fi
+  if (( OPT_DRY )); then
+    warn "would rewrite $(tilde "$XR_RUNTIME") to WiVRn (currently: ${state%% *})"
+    return 0
+  fi
+  if lib="$(py xr-write "$XR_RUNTIME" 2>/dev/null)"; then
+    ok "wrote $(tilde "$XR_RUNTIME") -> WiVRn"
+    note "$(tilde "$lib")"
+  else
+    bad "WiVRn not found — cannot write the OpenXR runtime file"
+    note "install it with:  flatpak install flathub io.github.wivrn.wivrn"
+    note "or your distro's wivrn package, then re-run '$SELF runtime'"
+    return 1
+  fi
+}
+
+do_patch() {
+  head_ "setupapi stub patch"
+  local targets=() g f real
+  declare -A seen=()
+
+  if (( OPT_ALL_PROTONS )); then
+    while read -r d; do
+      [[ -n "$d" ]] || continue
+      while read -r f; do [[ -n "$f" ]] && targets+=("$f"); done < <(dist_dlls "$d")
+    done < <(py protons "$STEAM_ROOT" | python3 -c 'import json,sys; [print(p["dir"]) for p in json.load(sys.stdin)]')
+  else
+    for g in "${GAMES[@]}"; do
+      load_game "$g"
+      while read -r f; do [[ -n "$f" ]] && targets+=("$f"); done < <(dist_dlls "${G_PROTON_DIR[$g]}")
+    done
+  fi
+  for g in "${GAMES[@]}"; do
+    load_game "$g"
+    [[ -n "${G_PREFIX[$g]}" && -e "${G_PREFIX[$g]}/drive_c/windows/system32/setupapi.dll" ]] \
+      && targets+=("${G_PREFIX[$g]}/drive_c/windows/system32/setupapi.dll")
+  done
+
+  if (( ! ${#targets[@]} )); then
+    warn "nothing to patch — no Proton dist or prefix found"
+    return 0
+  fi
+
+  local n_done=0
+  for f in "${targets[@]}"; do
+    real="$(readlink -f "$f" 2>/dev/null || printf '%s' "$f")"
+    # Prefix DLLs are often symlinks into a shared Proton dist. Patch each real
+    # file once, and say so, rather than appearing to patch two things.
+    if [[ -n "${seen[$real]:-}" ]]; then continue; fi
+    seen[$real]=1
+    printf '  %s\n' "$(tilde "$f")"
+    [[ "$real" != "$f" ]] && note "-> $(tilde "$real")"
+    if (( OPT_DRY )); then
+      note "would apply: $(py dll-state "$f")"
+      continue
+    fi
+    local msg rc=0
+    msg="$(py dll-patch "$f" "$( ((OPT_32)) && echo 32 || echo 64 )" 2>&1)" || rc=$?
+    if (( rc )); then note "${c_err}$msg${c_off}"; PROBLEMS=$((PROBLEMS+1)); else note "$msg"; n_done=$((n_done+1)); fi
+  done
+  (( n_done )) && ok "$n_done file(s) handled"
+  return 0
+}
+
+do_launch_opts() {
+  head_ "Steam launch options"
+  local want="$PV_VAR %command% ${VR_FLAGS[*]}"
+  local cfgs g appid cur
+  mapfile -t cfgs < <(py localconfigs "$STEAM_ROOT")
+  if (( ! ${#cfgs[@]} )); then
+    warn "no Steam user profile found — skipping launch options"
+    note "launch the game from Steam once, then re-run"
+    return 0
+  fi
+  if steam_running; then
+    warn "Steam is running — not touching launch options"
+    note "Steam rewrites localconfig.vdf when it exits and would discard the edit."
+    note "Close Steam and re-run, or set this by hand in the game's properties:"
+    note "$want"
+    return 0
+  fi
+  local c uid
+  for g in "${GAMES[@]}"; do
+    appid="${GAME_APPID[$g]}"
+    while read -r c; do
+      [[ -n "$c" ]] || continue
+      uid="$(basename "$(dirname "$(dirname "$c")")")"
+      cur="$(py launch-get "$c" "$appid" 2>/dev/null || true)"
+      if [[ "$cur" == *"PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1"* ]]; then
+        ok "${GAME_NAME[$g]}: already set ${c_dim}(profile $uid)${c_off}"
+        continue
+      fi
+      if (( OPT_DRY )); then
+        warn "${GAME_NAME[$g]}: would set profile $uid (currently '${cur:-empty}')"
+        note "$want"
+        continue
+      fi
+      mkdir -p "$BACKUPS"
+      cp -p "$c" "$BACKUPS/localconfig.$uid.vdf.bak" 2>/dev/null || true
+      if py launch-set "$c" "$appid" "$want" 2>/dev/null; then
+        ok "${GAME_NAME[$g]}: set ${c_dim}(profile $uid)${c_off}"
+        note "$want"
+      else
+        warn "${GAME_NAME[$g]}: could not edit $(tilde "$c") — set it by hand:"
+        note "$want"
+      fi
+    done < <(py launch-profiles "$STEAM_ROOT" "$appid")
+  done
+}
+
+do_mode() {   # $1 = 1 on / 0 off
+  local enable="$1" g label
+  label=$( ((enable)) && echo "VR" || echo "flat" )
+  for g in "${GAMES[@]}"; do
+    load_game "$g"
+    head_ "${GAME_NAME[$g]} -> $label"
+    local tmp="${G_TMP[$g]}"
+    if [[ -z "$tmp" || ! -f "$tmp" ]]; then
+      if [[ -z "${G_PREFIX[$g]}" ]]; then
+        warn "no Proton prefix yet — launch the game from Steam once, then re-run"
+      else
+        warn "TruckersMP config not found"
+        note "$(tilde "${tmp:-<unknown>}")"
+        note "if you use TruckersMP, open its launcher once so the file is created"
+        note "if you do not use TruckersMP, the Steam launch options are enough"
+      fi
+    elif (( OPT_DRY )); then
+      warn "would set TruckersMP consoleOpts (currently: $(py tmp-get "$tmp" "$g" || echo '?'))"
+    else
+      mkdir -p "$BACKUPS"
+      # Keep the very first copy forever — a plain .bak would be overwritten by
+      # the next toggle, so by the time anyone wants it back it is already gone.
+      [[ -f "$BACKUPS/launcher-options.${G_APPID[$g]}.orig.json" ]] \
+        || cp -p "$tmp" "$BACKUPS/launcher-options.${G_APPID[$g]}.orig.json"
+      cp -p "$tmp" "$BACKUPS/launcher-options.${G_APPID[$g]}.last.json"
+      local res
+      res="$(py tmp-set "$tmp" "$g" "$enable" "${VR_FLAGS[@]}")" || { bad "could not write TruckersMP options"; continue; }
+      local opts stripped restored
+      opts="$(py_json_list "$res" opts)"
+      stripped="$(py_json_list "$res" stripped)"
+      restored="$(py_json_list "$res" restored)"
+      ok "TruckersMP consoleOpts = ${opts:-(none)}"
+      [[ -n "$stripped" ]] && note "set aside (breaks VR — needs DX11): $stripped"
+      [[ -n "$restored" ]] && note "put back: $restored"
+    fi
+  done
+
+  if (( enable )); then
+    do_runtime || true
+    if ! wivrn_running; then
+      warn "WiVRn server is not running — start it before launching the game"
+    fi
+  fi
+}
+
+do_protons() {
+  head_ "Installed Proton builds"
+  py protons "$STEAM_ROOT" | python3 -c '
+import json, sys, os
+rows = json.load(sys.stdin)
+if not rows:
+    print("  none found"); raise SystemExit
+mark = {"yes": "\033[32m VR \033[0m", "no": "\033[31m --- \033[0m", "unknown": "\033[33m  ? \033[0m"}
+plain = {"yes": " VR ", "no": " ---", "unknown": "  ? "}
+color = sys.stdout.isatty()
+w = max(len(r["names"][0]) for r in rows)
+for r in sorted(rows, key=lambda r: (r["vr"] != "yes", r["names"][0].lower())):
+    m = (mark if color else plain)[r["vr"]]
+    print("  %s %-*s  %s" % (m, w, r["names"][0], r["reason"]))
+print()
+print("  VR  = has the wineopenxr XrSession fix (Proton PR #9915, 2026-07-07)")
+print("  --- = too old; the headset will never get a session")
+print("   ?  = unrecognised build — probably fine if it is newer than 2026-07-07")
+'
+}
+
+do_revert() {
+  head_ "Reverting"
+  local g f real
+  declare -A seen=()
+  for g in "${GAMES[@]}"; do
+    load_game "$g"
+    [[ -n "${G_TMP[$g]}" && -f "${G_TMP[$g]}" ]] && {
+      if (( OPT_DRY )); then warn "would clear VR flags for ${GAME_NAME[$g]}"
+      else py tmp-set "${G_TMP[$g]}" "$g" 0 "${VR_FLAGS[@]}" >/dev/null && ok "${GAME_NAME[$g]}: VR flags removed"; fi
+    }
+  done
+  while read -r f; do
+    [[ -n "$f" ]] || continue
+    real="$(readlink -f "$f")"
+    [[ -n "${seen[$real]:-}" ]] && continue
+    seen[$real]=1
+    # Only files we actually have an original for can be restored — say which
+    # those are instead of listing every Proton on the machine.
+    py dll-backup "$f" >/dev/null 2>&1 || continue
+    if (( OPT_DRY )); then warn "would restore $(tilde "$real")"
+    else printf '  %s\n' "$(tilde "$real")"; note "$(py dll-unpatch "$f")"; fi
+  done < <(py protons "$STEAM_ROOT" \
+            | python3 -c 'import json,sys; [print(p["dir"]) for p in json.load(sys.stdin)]' \
+            | while read -r d; do dist_dlls "$d"; done)
+  note "the OpenXR runtime file and Steam launch options were left alone —"
+  note "remove them by hand if you want a completely clean slate:"
+  note "$(tilde "$XR_RUNTIME")"
+}
+
+# --------------------------------------------------------------------- doctor
+
+do_doctor() {
+  local g
+  printf '\n%struckvr %s%s  %s%s%s\n' "$c_hd" "$VERSION" "$c_off" "$c_dim" "$(tilde "$STEAM_ROOT")" "$c_off"
+  [[ -n "${EXTRA_ROOTS:-}" ]] && note "other Steam installs ignored: $(tilde "$(tr '\n' ' ' <<<"$EXTRA_ROOTS")")"
+
+  head_ "Headset / OpenXR"
+  local xr; xr="$(py xr-state "$XR_RUNTIME")"
+  case "$xr" in
+    WIVRN*)   ok "OpenXR runtime: WiVRn"; note "$(tilde "${xr#WIVRN }")" ;;
+    STEAMVR*) bad "OpenXR runtime: SteamVR has taken it over"
+              note "SteamVR replaces this file and deletes it on exit."
+              note "fix: $SELF runtime   (and do not run SteamVR alongside WiVRn)" ;;
+    MONADO*)  warn "OpenXR runtime: Monado (not WiVRn)"; note "fix: $SELF runtime" ;;
+    MISSING)  bad "OpenXR runtime: not configured"
+              note "the game will not find a headset. fix: $SELF runtime" ;;
+    BROKEN)   bad "OpenXR runtime: $(tilde "$XR_RUNTIME") is not valid JSON"
+              note "fix: $SELF runtime" ;;
+    *)        warn "OpenXR runtime: unrecognised (${xr#* })"; note "fix: $SELF runtime" ;;
+  esac
+  # This env var beats the config file outright, so a stale one silently
+  # overrides everything this script writes.
+  if [[ -n "${XR_RUNTIME_JSON:-}" ]]; then
+    warn "XR_RUNTIME_JSON is set — it overrides $(tilde "$XR_RUNTIME")"
+    note "${XR_RUNTIME_JSON}"
+    note "unset it, or point it at the WiVRn manifest, or the game will use that instead"
+  fi
+  if py wivrn-lib >/dev/null 2>&1; then
+    ok "WiVRn installed"
+  else
+    bad "WiVRn not found"
+    note "flatpak install flathub io.github.wivrn.wivrn"
+  fi
+  # A sandboxed Steam has its own view of $HOME, so the runtime file we write
+  # on the host may simply not exist as far as the game is concerned.
+  case "$STEAM_ROOT" in
+    */.var/app/com.valvesoftware.Steam/*|*/snap/steam/*)
+      warn "Steam is sandboxed (Flatpak/Snap)"
+      note "it may not see $(tilde "$XR_RUNTIME"). Grant access with e.g."
+      note "flatpak override --user --filesystem=xdg-config/openxr:ro com.valvesoftware.Steam"
+      note "and --filesystem=~/.local/share/flatpak/app/io.github.wivrn.wivrn:ro" ;;
+  esac
+  if wivrn_running; then ok "WiVRn server: running"
+  else note "WiVRn server: not running (start it before launching the game)"; fi
+  steamvr_running && { bad "SteamVR is running"; note "close it — it steals the OpenXR runtime from WiVRn"; }
+  steam_running && note "Steam is running (launch options cannot be edited while it is)"
+
+  for g in "${GAMES[@]}"; do
+    load_game "$g"
+    head_ "${GAME_NAME[$g]}  ${c_dim}(appid ${GAME_APPID[$g]})${c_off}"
+
+    if [[ -z "${G_INSTALL[$g]}" ]]; then
+      warn "not installed in any Steam library"
+      continue
+    fi
+    ok "installed: $(tilde "${G_INSTALL[$g]}")"
+
+    if [[ -z "${G_PREFIX[$g]}" ]]; then
+      warn "no Proton prefix yet — launch it from Steam once"
+    fi
+
+    # --- mode
+    local tmp="${G_TMP[$g]}" opts=""
+    if [[ -n "$tmp" && -f "$tmp" ]]; then
+      opts="$(py tmp-get "$tmp" "$g" 2>/dev/null || true)"
+      if [[ " $opts " == *" -openxr "* ]]; then
+        ok "mode: VR   ${c_dim}(TruckersMP flags: $opts)${c_off}"
+      else
+        warn "mode: flat ${c_dim}(TruckersMP flags: ${opts:-none})${c_off}"
+        note "fix: $SELF on $g"
+      fi
+    else
+      note "TruckersMP not configured for this game (fine if you play singleplayer)"
+    fi
+
+    # --- launch options
+    local c cur found=0
+    while read -r c; do
+      [[ -n "$c" ]] || continue
+      cur="$(py launch-get "$c" "${GAME_APPID[$g]}" 2>/dev/null || true)"
+      [[ "$cur" == *"PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1"* ]] && found=1
+    done < <(py launch-profiles "$STEAM_ROOT" "${GAME_APPID[$g]}")
+    if (( found )); then
+      ok "Steam launch options: pressure-vessel import is set"
+    else
+      bad "Steam launch options: missing $PV_VAR"
+      note "without it the game cannot see WiVRn from inside Steam's container"
+      note "fix: close Steam, then $SELF install"
+    fi
+
+    # --- proton
+    local pn="${G_PROTON_NAME[$g]}"
+    if [[ -z "$pn" ]]; then
+      bad "Proton: could not determine which build runs this game"
+      note "set one in Steam > Properties > Compatibility"
+    else
+      case "${G_VR[$g]}" in
+        yes) ok "Proton: $pn ${c_dim}(${G_VR_WHY[$g]})${c_off}" ;;
+        no)  bad "Proton: $pn — too old for VR"
+             note "${G_VR_WHY[$g]}"
+             note "the game will render stereo on the monitor while the headset"
+             note "stays on the WiVRn lobby. pick one marked VR in: $SELF protons" ;;
+        *)   warn "Proton: $pn — cannot tell if it has the VR fix"
+             note "${G_VR_WHY[$g]}"
+             note "if it is newer than 2026-07-07 it is almost certainly fine" ;;
+      esac
+      [[ -n "${G_CHAIN[$g]}" ]] && note "resolved via: ${G_CHAIN[$g]}"
+      [[ -z "${G_PROTON_DIR[$g]}" ]] && {
+        bad "Proton '$pn' is not installed anywhere this script can see"
+        note "it may have been deleted or renamed. see: $SELF protons"; }
+    fi
+
+    # --- setupapi
+    if [[ -n "$tmp" && -f "$tmp" ]]; then
+      local dll st pfx_dll
+      dll="$(dist_dlls "${G_PROTON_DIR[$g]}" | head -1)"
+      pfx_dll="${G_PREFIX[$g]}/drive_c/windows/system32/setupapi.dll"
+      local s_dist="n/a" s_pfx="n/a"
+      [[ -n "$dll" ]] && s_dist="$(py dll-state "$dll")"
+      [[ -e "$pfx_dll" ]] && s_pfx="$(py dll-state "$pfx_dll")"
+      # A build that forwards the export elsewhere, or that finally implements
+      # it, needs no patch at all — that is a pass, not a failure.
+      local nofix_re='^(PATCHED|FORWARDED|IMPLEMENTED|NOEXPORT)'
+      if [[ "$s_dist" =~ $nofix_re && ( "$s_pfx" =~ $nofix_re || "$s_pfx" == n/a ) ]]; then
+        if [[ "$s_dist" == PATCHED* ]]; then ok "setupapi stub: patched"
+        else ok "setupapi stub: no patch needed ${c_dim}($s_dist)${c_off}"; fi
+      elif [[ "$s_dist" == "n/a" && "$s_pfx" =~ $nofix_re ]]; then
+        warn "setupapi stub: prefix patched, but the active Proton dist is not"
+        note "a Proton update or a prefix rebuild will undo it. fix: $SELF patch"
+      else
+        bad "setupapi stub: dist=$s_dist prefix=$s_pfx"
+        note "TruckersMP will abort at the login screen. fix: $SELF patch"
+      fi
+      if [[ -L "$pfx_dll" ]]; then
+        note "prefix DLL is a symlink -> $(tilde "$(readlink -f "$pfx_dll")")"
+      fi
+    fi
+  done
+
+  head_ "Summary"
+  if (( PROBLEMS )); then
+    bad "$PROBLEMS problem(s) found — run '$SELF install' to fix what can be fixed automatically"
+  elif (( WARNINGS )); then
+    ok "no blocking problems ($WARNINGS warning(s))"
+  else
+    ok "everything checks out"
+  fi
+  printf '\n%sStart WiVRn, connect the headset, then launch the game from Steam.\n' "$c_dim"
+  printf 'The headset sits on the WiVRn lobby for the first ~35s — that is normal.\n'
+  printf 'In game: F11 toggles VR, F12 recenters.%s\n\n' "$c_off"
+  (( PROBLEMS )) && return 1 || return 0
+}
+
+do_install() {
+  local g
+  printf '\n%struckvr %s — setting up VR%s\n' "$c_hd" "$VERSION" "$c_off"
+  if game_running; then
+    warn "a truck game is running — changes take effect at the next launch"
+  fi
+  do_runtime || true
+  do_patch
+  do_launch_opts
+  do_mode 1
+  for g in "${GAMES[@]}"; do
+    load_game "$g"
+    if [[ "${G_VR[$g]}" == no ]]; then
+      head_ "Proton"
+      bad "${GAME_NAME[$g]} is set to ${G_PROTON_NAME[$g]}, which cannot do VR"
+      note "${G_VR_WHY[$g]}"
+      note "pick a build marked VR from '$SELF protons', then either set it in"
+      note "Steam > Properties > Compatibility, or in SteamTinkerLaunch if you use it."
+    fi
+  done
+  PROBLEMS=0; WARNINGS=0
+  do_doctor
+}
+
+# ---------------------------------------------------------------------- main
+
+case "$CMD" in
+  version|--version) say "truckvr $VERSION"; exit 0 ;;
+esac
+
+discover_steam
+
+case "$CMD" in
+  doctor|status|check) do_doctor ;;
+  install|setup)       do_install ;;
+  on|vr|enable)        do_mode 1; PROBLEMS=0; WARNINGS=0; do_doctor ;;
+  off|flat|disable)    do_mode 0; PROBLEMS=0; WARNINGS=0; do_doctor ;;
+  patch)               do_patch ;;
+  runtime|xr)          do_runtime ;;
+  protons|proton)      do_protons ;;
+  revert|uninstall)    do_revert ;;
+  *)                   die "unknown command '$CMD' (try $SELF --help)" ;;
+esac

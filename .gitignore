@@ -1,0 +1,4 @@
+*.bak
+*.prevr
+*.log
+/scratch/
