@@ -20,11 +20,12 @@ Euro Truck Simulator 2  (appid 227300)
   ✔ Proton: GE-Proton11-3 (GE-Proton11-3 >= GE-Proton11-3)
       resolved via: Steam CompatToolMapping[227300] -> Proton-stl | 227300.conf USEPROTON -> GE-Proton11-3
   ✔ setupapi stub: patched
+  ✔ MessageBoxA NULL caption: patched
 ```
 
 ## Why this is not a two-line fix
 
-VR in these games needs four independent things to be right. Each one fails
+VR in these games needs five independent things to be right. Each one fails
 differently, and fixing one only reveals the next — which is what makes this
 frustrating to debug by hand.
 
@@ -34,6 +35,7 @@ frustrating to debug by hand.
 | 2 | **`PRESSURE_VESSEL_IMPORT_OPENXR_1_RUNTIMES=1`** in the Steam launch options | Steam's container cannot see WiVRn, so the game finds no runtime even though the host has one |
 | 3 | **A Proton with the wineopenxr session fix** (Valve PR #9915, 2026-07-07) | The nasty one: the game renders stereo *on your monitor* while the headset sits on the WiVRn lobby forever. It looks like a WiVRn problem. It isn't |
 | 4 | **A patched `setupapi.dll`** — only if you use TruckersMP | Game dies at the TruckersMP login screen |
+| 5 | **A patched `user32.dll`** — only if you use TruckersMP, only on GE-Proton | Game hard-crashes a couple of seconds into startup, and the crash log blames `ucrtbase!strcmp` as if the game were at fault |
 
 Hurdle 3 is worth expanding on. Prism3D destroys and recreates its `XrSession`
 during startup. Older `wineopenxr` kept the dead handle in its session list, so
@@ -48,6 +50,27 @@ master itself**, so every Proton has it. Calling a Wine stub raises
 calls it right after the audio and dinput threads spawn. `truckvr` patches the
 stub thunk to `xor eax,eax; ret` — returning FALSE, i.e. "no alias found",
 which is a perfectly ordinary answer that callers handle.
+
+Hurdle 5 is the opposite: it is **not** in upstream Wine, only in GE-Proton.
+Those builds carry a Star Citizen workaround inside `user32.MessageBoxExA` that
+suppresses one dialog by string-matching its caption:
+
+```asm
+lea  rdx, "Star Citizen"
+mov  rcx, r8          ; lpCaption, straight from the caller — never NULL-checked
+call strcmp
+```
+
+`MessageBoxA(hwnd, text, NULL, type)` is legal on Windows; a NULL caption just
+titles the box "Error". TruckersMP's `core_*mp.dll` uses exactly that to report
+a startup error — so instead of the dialog you get `C0000005 ACCESS_VIOLATION`
+and a crash log pointing at `ucrtbase!strcmp`, which reads like a game bug and
+sends you chasing mods, drivers and verify-files. `truckvr` replaces the `lea`
+with a two-byte jump to the normal dialog path, so the message actually appears.
+
+The site is found by scanning for the reference to the literal `"Star Citizen"`,
+not by a hardcoded offset, so it keeps working across Proton releases and
+reports `NOTPRESENT` — a pass, not a failure — on the builds that never had it.
 
 ## Requirements
 
@@ -121,10 +144,16 @@ Everything is reversible, and `--dry-run` shows you the plan first.
 | `<prefix>/…/TruckersMP/launcher-options.json` | adds/removes `-experimental_vr -openxr` in `consoleOpts` | `$XDG_DATA_HOME/truckvr/backups/` |
 | `userdata/*/config/localconfig.vdf` | sets the game's `LaunchOptions` | `$XDG_DATA_HOME/truckvr/backups/` |
 | `<proton>/files/lib/wine/x86_64-windows/setupapi.dll` | 3 bytes at one function entry | `setupapi.dll.truckvr-orig` beside it |
+| `<proton>/files/lib/wine/x86_64-windows/user32.dll` | 2 bytes inside `MessageBoxExA` | `user32.dll.truckvr-orig` beside it |
 
-The DLL patch refuses to touch anything that is not byte-for-byte the Wine stub
-thunk it expects, and it writes through symlinks atomically (prefix DLLs are
-often symlinks into a shared Proton dist).
+Both DLL patches apply to the Proton dist *and* to each game's prefix, because
+Proton gives every prefix its own copy and that copy is the one the game loads.
+
+Neither patch will touch anything that is not byte-for-byte the code it expects,
+and both write through symlinks atomically (prefix DLLs are sometimes symlinks
+into a shared Proton dist). Both are also exactly reconstructable without the
+backup file — they overwrite only constant opcode bytes — which matters because
+a Proton update deletes the backup while leaving the patched DLL in place.
 
 `truckvr revert` restores the DLLs from their backups and clears the VR flags.
 
@@ -151,12 +180,16 @@ That is a known TruckersMP limitation, not a problem with this setup.
 ## Testing
 
 ```sh
+./tests/run-all.sh            # everything
 ./tests/test-capability.sh    # the "does this Proton have the fix" rule
 ./tests/test-resolution.sh    # Proton/library/game discovery, on a synthetic Steam install
+./tests/test-msgbox.sh        # the user32 patch, round-tripped against a real DLL
 ```
 
 `test-resolution.sh` builds a throwaway Steam installation in `/tmp`, so it is
-safe to run anywhere and does not touch your real setup.
+safe to run anywhere and does not touch your real setup. `test-msgbox.sh` copies
+an installed `user32.dll` to a temp directory and patches the copy — it skips
+itself with a note if no GE-Proton is installed to test against.
 
 ## Credits
 

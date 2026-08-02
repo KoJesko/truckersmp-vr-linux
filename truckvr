@@ -7,7 +7,7 @@
 #   truckvr install            do whatever is needed to make VR work
 #   truckvr on   [ets2|ats]    enable VR for the next launch
 #   truckvr off  [ets2|ats]    back to flat (monitor) mode
-#   truckvr patch              (re)apply the setupapi stub patch
+#   truckvr patch              (re)apply the Wine/Proton binary patches
 #   truckvr runtime            point OpenXR at WiVRn
 #   truckvr protons            list installed Protons and whether each can do VR
 #   truckvr revert             undo everything this script changed
@@ -17,7 +17,7 @@
 # ---------------------------------------------------------------------------
 # WHY THIS SCRIPT EXISTS
 #
-# Getting these two games into VR on Linux means clearing four independent
+# Getting these two games into VR on Linux means clearing five independent
 # hurdles. Each one, on its own, produces a different flavour of "it doesn't
 # work", and fixing one only reveals the next:
 #
@@ -47,6 +47,16 @@
 #     binary-patches the stub thunk to return FALSE ("no alias found"), which
 #     is a perfectly normal result for that API.
 #
+#  5. TRUCKERSMP + MessageBoxA. Also TruckersMP only. Proton carries a Star
+#     Citizen workaround inside user32.MessageBoxExA that suppresses one
+#     specific dialog by string-matching its caption — with no NULL check on
+#     the pointer. MessageBoxA(hwnd, text, NULL, type) is legal on Windows (a
+#     NULL caption just titles the box "Error"), and core_*mp.dll uses exactly
+#     that to report a startup error. So instead of the dialog you get
+#     C0000005 ACCESS_VIOLATION about two seconds in, and the crash log blames
+#     ucrtbase!strcmp, which makes it look like a game bug. This script
+#     replaces the comparison with a jump straight to the normal dialog path.
+#
 # Plus one thing that is easy to miss: when TruckersMP launches the game it
 # builds its own command line, so VR flags placed in Steam's launch options
 # are thrown away. They have to go in TruckersMP's launcher-options.json too.
@@ -59,7 +69,7 @@ set -euo pipefail
 # which directory "wins" a name collision must not depend on the user's locale.
 export LC_COLLATE=C
 
-VERSION=1.0.0
+VERSION=1.1.0
 SELF=${0##*/}
 
 # ------------------------------------------------------------------ constants
@@ -768,7 +778,10 @@ def dll_unpatch(path):
     real = os.path.realpath(path)
     bak = dll_backup(path)
     if bak:
-        shutil.copyfile(bak, real)
+        # Proton ships these DLLs read-only, so restore through _write_through
+        # (temp file + rename, which only needs the directory to be writable)
+        # rather than opening the target for writing, which raises EACCES.
+        _write_through(real, open(bak, 'rb').read())
         os.unlink(bak)
         return 'restored from ' + os.path.basename(bak)
 
@@ -789,6 +802,162 @@ def dll_unpatch(path):
         return 'not patched — left alone'
     _write_through(real, bytes(data))
     return 'restored the original prologue (no backup file was needed)'
+
+# --------------------------------------------- MessageBoxA NULL-caption patch
+#
+# Proton's user32.MessageBoxExA opens with a Star Citizen workaround that
+# suppresses one dialog by string-matching it:
+#
+#     48 8d 15 <rel32>    lea  rdx, "Star Citizen"
+#     4c 89 c1            mov  rcx, r8      ; lpCaption, straight from the caller
+#     41 ff d6            call *r14         ; strcmp
+#     85 c0               test eax, eax
+#     75 <rel8>           jne  <normal path>
+#
+# Nothing checks r8 for NULL, so MessageBoxA(hwnd, text, NULL, type) — legal on
+# Windows, and what TruckersMP uses to report a startup error — dereferences
+# NULL and kills the process.
+#
+# The patch overwrites the two opcode bytes of the `lea` with a short jump to
+# the normal path, skipping the comparison entirely. The only behaviour lost is
+# the Star Citizen dialog suppression, which no truck sim will ever want.
+
+SC_NAME     = b'Star Citizen'
+LEA_RDX     = b'\x48\x8d\x15'          # lea rdx,[rip+rel32]
+MOV_RCX_R8  = b'\x4c\x89\xc1'          # mov rcx,r8
+CALL_R14    = b'\x41\xff\xd6'          # call *r14   (strcmp, via the IAT)
+TEST_EAX    = b'\x85\xc0'              # test eax,eax
+MSG_EXPORTS = (b'MessageBoxExA', b'MessageBoxA')
+MSG_SCAN    = 128                      # bytes of prologue to search
+
+def msg_site(pe):
+    """Find the Star Citizen caption comparison. -> (offset, kind) or None.
+
+    `kind` is UNPATCHED, PATCHED, or FOREIGN. None means this build simply has
+    no such comparison — upstream Wine, an older Proton, or one where it has
+    been fixed properly — all of which need nothing from us.
+
+    The anchor is the `lea` that addresses the literal "Star Citizen", chosen
+    because it survives the patch: only the two opcode bytes are overwritten,
+    leaving the rel32 that names the string intact. So one scan recognises a
+    file in either state, and no offset has to be hardcoded against a Proton
+    version.
+    """
+    d = pe.d
+    if pe.bits != 64:
+        return None
+    for name in MSG_EXPORTS:
+        try:
+            start = pe.find_export(name)
+        except ValueError:
+            continue                    # forwarded; not the code we want
+        if start is None:
+            continue
+        for off in range(start, min(start + MSG_SCAN, len(d) - 20)):
+            # The `15` is the ModRM byte of the lea and is untouched by the
+            # patch, so it anchors both states; the following mov proves the
+            # caption argument is what gets compared.
+            if d[off + 2] != 0x15 or bytes(d[off + 7:off + 10]) != MOV_RCX_R8:
+                continue
+            rva = pe.o2r(off)
+            if rva is None:
+                continue
+            rel = struct.unpack_from('<i', d, off + 3)[0]
+            if pe.cstr(pe.r2o(rva + 7 + rel)) != SC_NAME:
+                continue
+            if bytes(d[off:off + 3]) == LEA_RDX:
+                return off, 'UNPATCHED'
+            if d[off] == 0xEB:
+                return off, 'PATCHED'
+            return off, 'FOREIGN'
+    return None
+
+def msg_jump(pe, off):
+    """The two bytes that replace the `lea`, or None if the shape is unfamiliar.
+
+    Layout from `off`: lea(7) mov(3) call(3) test(2) jne rel8(2). The `jne`
+    already skips to the normal MessageBoxIndirectA path when the caption does
+    not match, so borrow its target rather than hardcoding one — that keeps the
+    patch correct even if the suppressed-dialog code around it is rearranged.
+    """
+    d = pe.d
+    if bytes(d[off + 10:off + 13]) != CALL_R14:
+        return None
+    if bytes(d[off + 13:off + 15]) != TEST_EAX or d[off + 15] != 0x75:
+        return None
+    rel8 = struct.unpack_from('<b', d, off + 16)[0]
+    disp = 15 + rel8                    # jne target (off+17+rel8), from off+2
+    if not -128 <= disp <= 127:
+        return None
+    return b'\xeb' + struct.pack('<b', disp)
+
+def msg_state(path):
+    if not os.path.exists(path):
+        return 'MISSING'
+    try:
+        pe = PE(open(path, 'rb').read())
+    except Exception as ex:
+        return f'ERROR {ex}'
+    site = msg_site(pe)
+    if site is None:
+        return 'NOTPRESENT'
+    off, kind = site
+    if kind == 'UNPATCHED' and msg_jump(pe, off) is None:
+        kind = 'FOREIGN'
+    if kind == 'FOREIGN':
+        return 'FOREIGN ' + ' '.join(f'{b:02x}' for b in pe.d[off:off + 8])
+    return kind
+
+def msg_patch(path):
+    real = os.path.realpath(path)
+    data = bytearray(open(real, 'rb').read())
+    pe = PE(data)
+    site = msg_site(pe)
+    if site is None:
+        return 'no Star Citizen caption hack in this build — nothing to do'
+    off, kind = site
+    if kind == 'PATCHED':
+        return 'already patched'
+    jmp = msg_jump(pe, off) if kind == 'UNPATCHED' else None
+    if jmp is None:
+        raise SystemExit('unexpected bytes at %#x (%s) — refusing to patch'
+                         % (off, ' '.join(f'{b:02x}' for b in data[off:off + 8])))
+    bak = dll_backup(real) or (real + '.truckvr-orig')
+    if not os.path.exists(bak):
+        shutil.copy2(real, bak)
+    data[off:off + len(jmp)] = jmp
+    _write_through(real, bytes(data))
+    return 'patched at %#x (backup %s)' % (off, os.path.basename(bak))
+
+def msg_unpatch(path):
+    """Undo the patch, with or without a backup file.
+
+    Like the setupapi one this is exactly reconstructable: the patch destroys
+    only the two constant opcode bytes of `lea rdx,[rip+rel32]`, and the
+    build-specific rel32 after them is never touched. That matters because a
+    Proton update deletes the backup living inside the dist directory while
+    leaving the patched DLL in place."""
+    real = os.path.realpath(path)
+    bak = dll_backup(path)
+    if bak:
+        _write_through(real, open(bak, 'rb').read())   # read-only dist; see dll_unpatch
+        os.unlink(bak)
+        return 'restored from ' + os.path.basename(bak)
+
+    data = bytearray(open(real, 'rb').read())
+    try:
+        pe = PE(data)
+    except Exception as ex:
+        return f'cannot read: {ex}'
+    site = msg_site(pe)
+    if site is None:
+        return 'no Star Citizen caption hack here — nothing to undo'
+    off, kind = site
+    if kind != 'PATCHED':
+        return 'not patched — left alone'
+    data[off:off + len(LEA_RDX)] = LEA_RDX
+    _write_through(real, bytes(data))
+    return 'restored the original instruction (no backup file was needed)'
 
 # ------------------------------------------------ TruckersMP launcher options
 
@@ -1108,6 +1277,12 @@ def main():
         if not b:
             sys.exit(1)
         print(b)
+    elif cmd == 'msg-state':
+        print(msg_state(a[0]))
+    elif cmd == 'msg-patch':
+        print(msg_patch(a[0]))
+    elif cmd == 'msg-unpatch':
+        print(msg_unpatch(a[0]))
     elif cmd == 'tmp-path':
         print(tmp_path(a[0]))
     elif cmd == 'tmp-get':
@@ -1203,7 +1378,8 @@ ${c_hd}COMMANDS${c_off}
   install       do whatever is needed to make VR work, then diagnose
   on            enable VR for the next launch
   off           back to flat (monitor) mode
-  patch         (re)apply the setupapi stub patch TruckersMP needs
+  patch         (re)apply the two binary patches TruckersMP needs
+                (setupapi stub, and the MessageBoxA NULL-caption crash)
   runtime       point OpenXR at WiVRn (fixes "no headset" after SteamVR ran)
   protons       list installed Protons and whether each one can do VR
   revert        undo everything this script changed
@@ -1316,20 +1492,23 @@ for p in json.load(sys.stdin):
 py_json()      { python3 -c 'import json,sys; print((json.loads(sys.argv[1]) or {}).get(sys.argv[2]) or "")' "$1" "$2"; }
 py_json_list() { python3 -c 'import json,sys; print(" | ".join((json.loads(sys.argv[1]) or {}).get(sys.argv[2]) or []))' "$1" "$2"; }
 
-dist_dlls() {   # $1 = proton dir -> the 64-bit setupapi.dll it ships
-  local d="$1" f
+dist_dll_named() {   # $1 = proton dir, $2 = basename -> the 64-bit DLL it ships
+  local d="$1" base="$2" f
   [[ -n "$d" ]] || return 0
   # Proton has shipped four different layouts; `dist/` is the pre-5.13 one and
   # is still on disk in older builds. The copy under share/default_pfx is a
   # symlink into these, so patching here also covers prefixes created later.
-  for f in "$d"/files/lib/wine/x86_64-windows/setupapi.dll \
-           "$d"/files/lib64/wine/x86_64-windows/setupapi.dll \
-           "$d"/dist/lib/wine/x86_64-windows/setupapi.dll \
-           "$d"/dist/lib64/wine/x86_64-windows/setupapi.dll; do
+  for f in "$d"/files/lib/wine/x86_64-windows/"$base" \
+           "$d"/files/lib64/wine/x86_64-windows/"$base" \
+           "$d"/dist/lib/wine/x86_64-windows/"$base" \
+           "$d"/dist/lib64/wine/x86_64-windows/"$base"; do
     [[ -f "$f" ]] && { printf '%s\n' "$f"; return 0; }
   done
   return 0
 }
+
+dist_dlls()   { dist_dll_named "$1" setupapi.dll; }   # hurdle 4
+dist_user32() { dist_dll_named "$1" user32.dll;   }   # hurdle 5
 
 # ------------------------------------------------------------------- processes
 
@@ -1363,26 +1542,31 @@ do_runtime() {
   fi
 }
 
-do_patch() {
-  head_ "setupapi stub patch"
-  local targets=() g f real
+# Apply one binary patch everywhere it is needed.
+#   $1 heading   $2 dist-locator function   $3 DLL basename   $4 engine verb
+# Both Proton dists and per-game prefixes are targets: Proton gives each prefix
+# its own copy of these DLLs, and the prefix copy is the one the game loads.
+patch_dlls() {
+  local title="$1" locate="$2" base="$3" verb="$4"
+  head_ "$title"
+  local targets=() g f real d
   declare -A seen=()
 
   if (( OPT_ALL_PROTONS )); then
     while read -r d; do
       [[ -n "$d" ]] || continue
-      while read -r f; do [[ -n "$f" ]] && targets+=("$f"); done < <(dist_dlls "$d")
+      while read -r f; do [[ -n "$f" ]] && targets+=("$f"); done < <("$locate" "$d")
     done < <(py protons "$STEAM_ROOT" | python3 -c 'import json,sys; [print(p["dir"]) for p in json.load(sys.stdin)]')
   else
     for g in "${GAMES[@]}"; do
       load_game "$g"
-      while read -r f; do [[ -n "$f" ]] && targets+=("$f"); done < <(dist_dlls "${G_PROTON_DIR[$g]}")
+      while read -r f; do [[ -n "$f" ]] && targets+=("$f"); done < <("$locate" "${G_PROTON_DIR[$g]}")
     done
   fi
   for g in "${GAMES[@]}"; do
     load_game "$g"
-    [[ -n "${G_PREFIX[$g]}" && -e "${G_PREFIX[$g]}/drive_c/windows/system32/setupapi.dll" ]] \
-      && targets+=("${G_PREFIX[$g]}/drive_c/windows/system32/setupapi.dll")
+    [[ -n "${G_PREFIX[$g]}" && -e "${G_PREFIX[$g]}/drive_c/windows/system32/$base" ]] \
+      && targets+=("${G_PREFIX[$g]}/drive_c/windows/system32/$base")
   done
 
   if (( ! ${#targets[@]} )); then
@@ -1400,15 +1584,25 @@ do_patch() {
     printf '  %s\n' "$(tilde "$f")"
     [[ "$real" != "$f" ]] && note "-> $(tilde "$real")"
     if (( OPT_DRY )); then
-      note "would apply: $(py dll-state "$f")"
+      note "would apply: $(py "$verb-state" "$f")"
       continue
     fi
     local msg rc=0
-    msg="$(py dll-patch "$f" "$( ((OPT_32)) && echo 32 || echo 64 )" 2>&1)" || rc=$?
+    if [[ "$verb" == dll ]]; then
+      # Only the setupapi patch has a 32-bit variant to opt into.
+      msg="$(py dll-patch "$f" "$( ((OPT_32)) && echo 32 || echo 64 )" 2>&1)" || rc=$?
+    else
+      msg="$(py "$verb-patch" "$f" 2>&1)" || rc=$?
+    fi
     if (( rc )); then note "${c_err}$msg${c_off}"; PROBLEMS=$((PROBLEMS+1)); else note "$msg"; n_done=$((n_done+1)); fi
   done
   (( n_done )) && ok "$n_done file(s) handled"
   return 0
+}
+
+do_patch() {
+  patch_dlls "setupapi stub patch"            dist_dlls   setupapi.dll dll
+  patch_dlls "MessageBoxA NULL-caption patch" dist_user32 user32.dll   msg
 }
 
 do_launch_opts() {
@@ -1523,6 +1717,40 @@ print("   ?  = unrecognised build — probably fine if it is newer than 2026-07-
 '
 }
 
+# Every copy of $2 this script could have patched: one per Proton dist, plus
+# one per game prefix (Proton gives each prefix its own copy).
+revert_targets() {
+  local locate="$1" base="$2" d g
+  while read -r d; do [[ -n "$d" ]] && "$locate" "$d"; done \
+    < <(py protons "$STEAM_ROOT" | python3 -c 'import json,sys; [print(p["dir"]) for p in json.load(sys.stdin)]')
+  for g in "${GAMES[@]}"; do
+    load_game "$g"
+    [[ -n "${G_PREFIX[$g]}" ]] && printf '%s\n' "${G_PREFIX[$g]}/drive_c/windows/system32/$base"
+  done
+}
+
+# Undo one binary patch wherever it was applied.
+#   $1 dist-locator function   $2 DLL basename   $3 engine verb
+revert_dlls() {
+  local locate="$1" base="$2" verb="$3"
+  local f real
+  declare -A seen=()
+  while read -r f; do
+    [[ -n "$f" && -e "$f" ]] || continue
+    real="$(readlink -f "$f")"
+    [[ -n "${seen[$real]:-}" ]] && continue
+    seen[$real]=1
+    # Touch only what we actually changed: either truckvr left a backup beside
+    # it, or the file still carries the patch — the un-patch can rebuild the
+    # original either way. Anything else is someone else's file.
+    py dll-backup "$f" >/dev/null 2>&1 \
+      || [[ "$(py "$verb-state" "$f" 2>/dev/null)" == PATCHED* ]] \
+      || continue
+    if (( OPT_DRY )); then warn "would restore $(tilde "$real")"
+    else printf '  %s\n' "$(tilde "$real")"; note "$(py "$verb-unpatch" "$f")"; fi
+  done < <(revert_targets "$locate" "$base")
+}
+
 do_revert() {
   head_ "Reverting"
   local g f real
@@ -1534,19 +1762,8 @@ do_revert() {
       else py tmp-set "${G_TMP[$g]}" "$g" 0 "${VR_FLAGS[@]}" >/dev/null && ok "${GAME_NAME[$g]}: VR flags removed"; fi
     }
   done
-  while read -r f; do
-    [[ -n "$f" ]] || continue
-    real="$(readlink -f "$f")"
-    [[ -n "${seen[$real]:-}" ]] && continue
-    seen[$real]=1
-    # Only files we actually have an original for can be restored — say which
-    # those are instead of listing every Proton on the machine.
-    py dll-backup "$f" >/dev/null 2>&1 || continue
-    if (( OPT_DRY )); then warn "would restore $(tilde "$real")"
-    else printf '  %s\n' "$(tilde "$real")"; note "$(py dll-unpatch "$f")"; fi
-  done < <(py protons "$STEAM_ROOT" \
-            | python3 -c 'import json,sys; [print(p["dir"]) for p in json.load(sys.stdin)]' \
-            | while read -r d; do dist_dlls "$d"; done)
+  revert_dlls dist_dlls   setupapi.dll dll
+  revert_dlls dist_user32 user32.dll   msg
   note "the OpenXR runtime file and Steam launch options were left alone —"
   note "remove them by hand if you want a completely clean slate:"
   note "$(tilde "$XR_RUNTIME")"
@@ -1688,6 +1905,32 @@ do_doctor() {
       fi
       if [[ -L "$pfx_dll" ]]; then
         note "prefix DLL is a symlink -> $(tilde "$(readlink -f "$pfx_dll")")"
+      fi
+    fi
+
+    # --- user32 MessageBoxA NULL caption
+    if [[ -n "$tmp" && -f "$tmp" ]]; then
+      local u_dist u_pfx s_udist="n/a" s_upfx="n/a"
+      u_dist="$(dist_user32 "${G_PROTON_DIR[$g]}" | head -1)"
+      u_pfx="${G_PREFIX[$g]}/drive_c/windows/system32/user32.dll"
+      [[ -n "$u_dist" ]] && s_udist="$(py msg-state "$u_dist")"
+      [[ -e "$u_pfx"  ]] && s_upfx="$(py msg-state "$u_pfx")"
+      # NOTPRESENT means this build has no Star Citizen hack to trip over, which
+      # is a pass, not a failure.
+      local msg_ok_re='^(PATCHED|NOTPRESENT|MISSING)'
+      if [[ "$s_upfx" == PATCHED* && "$s_udist" == UNPATCHED* ]]; then
+        warn "MessageBoxA NULL caption: prefix patched, but the Proton dist is not"
+        note "a Proton update or a prefix rebuild will undo it. fix: $SELF patch"
+      elif [[ "$s_udist" =~ $msg_ok_re && ( "$s_upfx" =~ $msg_ok_re || "$s_upfx" == n/a ) ]]; then
+        if [[ "$s_udist" == PATCHED* || "$s_upfx" == PATCHED* ]]; then
+          ok "MessageBoxA NULL caption: patched"
+        else
+          ok "MessageBoxA NULL caption: no patch needed ${c_dim}($s_udist)${c_off}"
+        fi
+      else
+        bad "MessageBoxA NULL caption: dist=$s_udist prefix=$s_upfx"
+        note "TruckersMP dies with C0000005 in strcmp instead of showing its"
+        note "error dialog, a couple of seconds into startup. fix: $SELF patch"
       fi
     fi
   done
