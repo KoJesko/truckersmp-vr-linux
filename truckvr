@@ -1354,7 +1354,10 @@ def main():
 main()
 PYEOF
 
-py() { python3 -c "$PY_ENGINE" "$@"; }
+# -I (isolated mode) on every python3 call: plain `python3 -c` puts the current
+# directory first on sys.path, so running truckvr from a folder holding a stray
+# json.py / re.py (a Downloads dir, an unpacked archive) would execute it.
+py() { python3 -I -c "$PY_ENGINE" "$@"; }
 
 # --------------------------------------------------------------- option parsing
 
@@ -1475,7 +1478,7 @@ load_game() {
 
   if [[ -n "$OPT_PROTON" ]]; then
     local pd
-    pd="$(py protons "$STEAM_ROOT" | python3 -c '
+    pd="$(py protons "$STEAM_ROOT" | python3 -I -c '
 import json,sys
 want=sys.argv[1].lower()
 for p in json.load(sys.stdin):
@@ -1489,8 +1492,8 @@ for p in json.load(sys.stdin):
   fi
 }
 
-py_json()      { python3 -c 'import json,sys; print((json.loads(sys.argv[1]) or {}).get(sys.argv[2]) or "")' "$1" "$2"; }
-py_json_list() { python3 -c 'import json,sys; print(" | ".join((json.loads(sys.argv[1]) or {}).get(sys.argv[2]) or []))' "$1" "$2"; }
+py_json()      { python3 -I -c 'import json,sys; print((json.loads(sys.argv[1]) or {}).get(sys.argv[2]) or "")' "$1" "$2"; }
+py_json_list() { python3 -I -c 'import json,sys; print(" | ".join((json.loads(sys.argv[1]) or {}).get(sys.argv[2]) or []))' "$1" "$2"; }
 
 dist_dll_named() {   # $1 = proton dir, $2 = basename -> the 64-bit DLL it ships
   local d="$1" base="$2" f
@@ -1556,7 +1559,7 @@ patch_dlls() {
     while read -r d; do
       [[ -n "$d" ]] || continue
       while read -r f; do [[ -n "$f" ]] && targets+=("$f"); done < <("$locate" "$d")
-    done < <(py protons "$STEAM_ROOT" | python3 -c 'import json,sys; [print(p["dir"]) for p in json.load(sys.stdin)]')
+    done < <(py protons "$STEAM_ROOT" | python3 -I -c 'import json,sys; [print(p["dir"]) for p in json.load(sys.stdin)]')
   else
     for g in "${GAMES[@]}"; do
       load_game "$g"
@@ -1698,7 +1701,7 @@ do_mode() {   # $1 = 1 on / 0 off
 
 do_protons() {
   head_ "Installed Proton builds"
-  py protons "$STEAM_ROOT" | python3 -c '
+  py protons "$STEAM_ROOT" | python3 -I -c '
 import json, sys, os
 rows = json.load(sys.stdin)
 if not rows:
@@ -1722,7 +1725,7 @@ print("   ?  = unrecognised build — probably fine if it is newer than 2026-07-
 revert_targets() {
   local locate="$1" base="$2" d g
   while read -r d; do [[ -n "$d" ]] && "$locate" "$d"; done \
-    < <(py protons "$STEAM_ROOT" | python3 -c 'import json,sys; [print(p["dir"]) for p in json.load(sys.stdin)]')
+    < <(py protons "$STEAM_ROOT" | python3 -I -c 'import json,sys; [print(p["dir"]) for p in json.load(sys.stdin)]')
   for g in "${GAMES[@]}"; do
     load_game "$g"
     [[ -n "${G_PREFIX[$g]}" ]] && printf '%s\n' "${G_PREFIX[$g]}/drive_c/windows/system32/$base"
